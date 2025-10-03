@@ -1,15 +1,9 @@
 # Cloud Build pipeline: Terraform (GKE + Cloud SQL + secrets) -> Helm (Vikunja)
 # Project: vikunja-case (717226960827)
 # Region: europe-west4
-
 timeout: "3600s"
 options:
   logging: CLOUD_LOGGING_ONLY
-
-# Defaults (can still be overridden in the trigger)
-substitutions:
-  _REGION: europe-west4
-  _TFSTATE_BUCKET: vikunja-case-tfstate
 
 steps:
   # 1) Terraform init/apply with GCS backend, then write outputs to /workspace/env.out
@@ -19,75 +13,32 @@ steps:
     args:
       - -ceu
       - |
+        # Static config (no Cloud Build substitutions)
+        REGION="europe-west4"
+        TFSTATE_BUCKET="vikunja-case-tfstate"
+        # Build project from gcloud config
+        PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
+
         cd infra/terraform
 
         terraform init -input=false \
-          -backend-config="bucket=${_TFSTATE_BUCKET}" \
+          -backend-config="bucket=$TFSTATE_BUCKET" \
           -backend-config="prefix=vikunja/state"
 
         terraform apply -input=false -auto-approve \
-          -var="project_id=${PROJECT_ID}" \
-          -var="region=${_REGION}"
+          -var="project_id=$PROJECT_ID" \
+          -var="region=$REGION"
 
         # Read outputs (fail fast if cluster name is missing)
-        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)" || { echo "Missing TF output gke_autopilot_name"; exit 1; }
+        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
         INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
 
-        # Write an env file for later steps (NO ${...} here; only $VAR)
+        # Write an env file for later steps (only $VAR; no ${...})
         {
-          echo "PROJECT_ID=${PROJECT_ID}"
-          echo "REGION=${_REGION}"
+          echo "PROJECT_ID=$PROJECT_ID"
+          echo "REGION=$REGION"
           echo "CLUSTER_NAME=$CLUSTER_NAME"
           if [ -n "$INSTANCE_CONN_NAME" ]; then
             echo "INSTANCE_CONN_NAME=$INSTANCE_CONN_NAME"
           fi
         } > /workspace/env.out
-
-        echo "Wrote /workspace/env.out:"
-        cat /workspace/env.out
-
-  # 2) Get GKE creds, create K8s secrets, install Helm chart
-  - id: "kubectl + helm deploy"
-    name: "gcr.io/cloud-builders/gcloud"
-    entrypoint: "bash"
-    args:
-      - -ceu
-      - |
-        # Load values exported by previous step
-        source /workspace/env.out
-        echo "Using cluster: $CLUSTER_NAME in $REGION, project ${PROJECT_ID}"
-
-        # Get kubeconfig for this step
-        gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "${PROJECT_ID}"
-
-        # Namespace
-        kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
-
-        # DB password from Secret Manager -> K8s secret
-        DB_PASS=$(gcloud secrets versions access latest --secret=vikunja-db-password --project "${PROJECT_ID}")
-        kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=POSTGRES_PASSWORD="$DB_PASS" \
-          --from-literal=POSTGRES_USER="vikunja" \
-          --from-literal=POSTGRES_DB="vikunja" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
-        # App JWT secret (create once)
-        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
-          JWT=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-          kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$JWT"
-        fi
-
-        # Install Helm
-        curl -sSL "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz" -o /tmp/helm.tgz
-        tar -xzf /tmp/helm.tgz -C /tmp
-        mv /tmp/linux-amd64/helm /usr/local/bin/helm
-        helm version
-
-        # Helm upgrade (pass Cloud SQL instance if present)
-        HELM_ARGS="-n vikunja --create-namespace"
-        if [ -n "$INSTANCE_CONN_NAME" ]; then
-          HELM_ARGS="$HELM_ARGS --set cloudsql.instanceConnectionName=$INSTANCE_CONN_NAME"
-        fi
-
-        helm upgrade --install vikunja ./helm/vikunja $HELM_ARGS
