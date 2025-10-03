@@ -1,4 +1,4 @@
-# Cloud Build: Terraform (GKE + Cloud SQL) -> K8s secrets -> Helm (Vikunja) running succesfully
+# Cloud Build: Terraform (GKE + Cloud SQL) -> K8s secrets -> Helm (Vikunja)
 # Project: vikunja-case (717226960827) | Region: europe-west4
 timeout: "3600s"
 options:
@@ -8,9 +8,9 @@ steps:
   # 1) Terraform init/apply (GCS backend), then write outputs to /workspace/env.out
   - id: "terraform apply + outputs"
     name: "hashicorp/terraform:1.9.6"
-    entrypoint: "bash"
+    entrypoint: "sh"
     args:
-      - -ceu
+      - -c
       - |
         set -euo pipefail
         REGION="europe-west4"
