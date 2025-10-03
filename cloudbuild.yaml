@@ -1,4 +1,3 @@
-# Cloud Build: Terraform (GKE Autopilot + Cloud SQL) -> K8s secrets -> Helm (Vikunja)
 timeout: "3600s"
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -7,53 +6,46 @@ steps:
   - id: "terraform apply + outputs"
     name: "hashicorp/terraform:1.9.6"
     entrypoint: "bash"
+    # Make built-ins/custom subs available to the script as env vars
+    env:
+      - PROJECT_ID=$PROJECT_ID
+      - REGION=europe-west4
+      - CLUSTER_NAME=vikunja-autopilot
+      - TFSTATE_BUCKET=${_TFSTATE_BUCKET}
     args:
       - -ceu
       - |
         set -euo pipefail
 
-        # --------- SETTINGS (match your TF config) ----------
-        PROJECT_ID="${PROJECT_ID:-vikunja-case}"
-        REGION="europe-west4"
-        TFSTATE_BUCKET="vikunja-case-tfstate"
-        CLUSTER_NAME="vikunja-autopilot"   # <- matches your main.tf 'name'
-        # ----------------------------------------------------
+        # Fallback if custom substitution not set
+        TFSTATE_BUCKET="${TFSTATE_BUCKET:-${PROJECT_ID}-tfstate}"
 
         cd infra/terraform
 
         terraform init -input=false \
-          -backend-config="bucket=$TFSTATE_BUCKET" \
+          -backend-config="bucket=${TFSTATE_BUCKET}" \
           -backend-config="prefix=vikunja/state"
 
-        # If the cluster resource is present in state, drop it (removes taint flag),
-        # then import the *existing* cluster so it's clean and managed again.
+        # Clear any taint by re-importing the live cluster (no-op if absent)
         if terraform state list | grep -q '^google_container_cluster\.autopilot$'; then
           terraform state rm google_container_cluster.autopilot || true
         fi
-
-        # Try import (succeeds if the cluster already exists; otherwise it's ok to continue)
         terraform import google_container_cluster.autopilot \
           "projects/${PROJECT_ID}/locations/${REGION}/clusters/${CLUSTER_NAME}" || true
 
-        # Now apply without forcing a replace
         terraform apply -input=false -auto-approve \
           -var="project_id=${PROJECT_ID}" \
           -var="region=${REGION}"
 
-        # Collect outputs for later steps (instance is optional)
+        # Save outputs/env for next step
         INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
-
         {
           echo "PROJECT_ID=${PROJECT_ID}"
           echo "REGION=${REGION}"
           echo "CLUSTER_NAME=${CLUSTER_NAME}"
-          if [ -n "${INSTANCE_CONN_NAME}" ]; then
-            echo "INSTANCE_CONN_NAME=${INSTANCE_CONN_NAME}"
-          fi
+          [ -n "${INSTANCE_CONN_NAME}" ] && echo "INSTANCE_CONN_NAME=${INSTANCE_CONN_NAME}"
         } > /workspace/env.out
-
-        echo "=== env.out ==="
-        cat /workspace/env.out
+        echo "=== env.out ==="; cat /workspace/env.out
 
   - id: "kubectl + helm deploy"
     name: "gcr.io/cloud-builders/gcloud"
@@ -63,15 +55,10 @@ steps:
       - |
         set -euo pipefail
         source /workspace/env.out
-        echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}"
-
-        # Auth to the cluster
         gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
 
-        # Namespace
         kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
 
-        # DB password from Secret Manager -> K8s Secret
         DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "${PROJECT_ID}")"
         kubectl -n vikunja create secret generic vikunja-db-secret \
           --from-literal=POSTGRES_PASSWORD="${DB_PASS}" \
@@ -79,14 +66,12 @@ steps:
           --from-literal=POSTGRES_DB="vikunja" \
           --dry-run=client -o yaml | kubectl apply -f -
 
-        # App JWT (once)
         if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
           JWT="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
           kubectl -n vikunja create secret generic vikunja-app-secret \
             --from-literal=VIKUNJA_SERVICE_JWTSECRET="${JWT}"
         fi
 
-        # Install Helm into a writable path
         mkdir -p /workspace/bin
         curl -sSL "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz" -o /workspace/helm.tgz
         tar -xzf /workspace/helm.tgz -C /workspace
@@ -94,12 +79,10 @@ steps:
         chmod +x /workspace/bin/helm
         /workspace/bin/helm version
 
-        # Helm upgrade (pass Cloud SQL connection if we have it)
         HELM_ARGS="-n vikunja --create-namespace"
         if [ -n "${INSTANCE_CONN_NAME:-}" ]; then
           HELM_ARGS="${HELM_ARGS} --set cloudsql.instanceConnectionName=${INSTANCE_CONN_NAME}"
         fi
-
         /workspace/bin/helm upgrade --install vikunja ./helm/vikunja ${HELM_ARGS}
 
         echo "Waiting for vikunja service external IP..."
