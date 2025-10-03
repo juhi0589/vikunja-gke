@@ -1,4 +1,4 @@
-# Cloud Build pipeline: Terraform (GKE + Cloud SQL + secrets) -> Helm (Vikunja)
+# Cloud Build pipeline: Terraform (GKE + Cloud SQL + secrets) -> Helm (Vikunja) Running
 # Project: vikunja-case (717226960827)
 # Region: europe-west4
 timeout: "3600s"
