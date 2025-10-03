@@ -1,6 +1,6 @@
 substitutions:
   _PROJECT_ID: ${PROJECT_ID}
-  _REGION: us-central1
+  _REGION: europe-west4
   _TFSTATE_BUCKET: ""
 
 options:
