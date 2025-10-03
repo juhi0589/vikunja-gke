@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vikunja-frontend
+  namespace: vikunja
+  labels:
+    app: vikunja-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vikunja-frontend
+  template:
+    metadata:
+      labels:
+        app: vikunja-frontend
+    spec:
+      containers:
+      - name: frontend
+        image: {{ .Values.image.frontend | quote }}
+        ports:
+        - containerPort: 80
+        env:
+        - name: VIKUNJA_API_URL
+          value: "/api/v1"
+        readinessProbe:
+          httpGet: { path: /, port: 80 }
+          initialDelaySeconds: 5
+        livenessProbe:
+          httpGet: { path: /, port: 80 }
+          initialDelaySeconds: 10

@@ -1,0 +1,64 @@
+substitutions:
+  _PROJECT_ID: ${PROJECT_ID}
+  _REGION: us-central1
+  _TFSTATE_BUCKET: ""
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+# Terraform apply (infra)
+- name: hashicorp/terraform:1.6.6
+  id: Terraform Apply
+  entrypoint: sh
+  args:
+    - -ceu
+    - |
+      cd infra/terraform
+      terraform init -backend-config="bucket=${_TFSTATE_BUCKET}" -backend-config="prefix=vikunja/state"
+      terraform apply -auto-approve -var="project_id=${_PROJECT_ID}" -var="region=${_REGION}"
+      echo INSTANCE_CONN_NAME=$(terraform output -raw instance_connection_name) >> /workspace/env.out
+
+# Get cluster credentials
+- name: gcr.io/cloud-builders/gcloud
+  id: Get GKE Credentials
+  args:
+    [
+      "container","clusters","get-credentials","todo",
+      "--region","${_REGION}",
+      "--project","${_PROJECT_ID}"
+    ]
+
+# Prepare namespace and secrets (DB creds from Secret Manager + app JWT)
+- name: gcr.io/cloud-builders/gcloud
+  id: Prepare K8s Secrets
+  entrypoint: bash
+  args:
+    - -ceu
+    - |
+      source /workspace/env.out
+      kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
+
+      DB_PASS=$(gcloud secrets versions access latest --secret=vikunja-db-password --project ${_PROJECT_ID})
+      kubectl -n vikunja create secret generic vikunja-db-secret         --from-literal=POSTGRES_PASSWORD="${DB_PASS}"         --from-literal=POSTGRES_USER="vikunja"         --from-literal=POSTGRES_DB="vikunja"         --dry-run=client -o yaml | kubectl apply -f -
+
+      if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
+        JWT=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        kubectl -n vikunja create secret generic vikunja-app-secret           --from-literal=VIKUNJA_SERVICE_JWTSECRET="${JWT}"
+      fi
+
+# Helm deploy (uses upstream Vikunja images)
+- name: alpine/helm:3.12.3
+  id: Helm Upgrade
+  entrypoint: sh
+  args:
+    - -ceu
+    - |
+      source /workspace/env.out
+      helm upgrade --install vikunja ./helm/vikunja         --namespace vikunja         --set gsaEmail=vikunja-sql@${_PROJECT_ID}.iam.gserviceaccount.com         --set cloudsql.instanceConnectionName="${INSTANCE_CONN_NAME}"
+
+# Wait for rollout
+- name: gcr.io/cloud-builders/kubectl
+  id: Wait for Rollout
+  args:
+    ["-n","vikunja","rollout","status","deploy/vikunja-api","--timeout=300s"]

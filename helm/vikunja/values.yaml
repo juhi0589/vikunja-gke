@@ -1,0 +1,25 @@
+namespace: vikunja
+
+image:
+  api: "vikunja/api:latest"
+  frontend: "vikunja/frontend:latest"
+
+db:
+  name: "vikunja"
+  user: "vikunja"
+  passwordSecretName: "vikunja-db-secret"  # K8s secret created by pipeline
+  host: "127.0.0.1"
+  port: 5432
+
+cloudsql:
+  instanceConnectionName: ""   # PROJECT:REGION:INSTANCE
+  image: "gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.11.4"
+
+gsaEmail: ""  # vikunja-sql@PROJECT_ID.iam.gserviceaccount.com for Workload Identity
+
+storage:
+  size: 5Gi
+
+ingress:
+  enabled: false
+  host: ""

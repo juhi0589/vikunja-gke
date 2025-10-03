@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vikunja-api-pdb
+  namespace: vikunja
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: vikunja-api
