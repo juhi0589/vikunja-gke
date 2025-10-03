@@ -6,7 +6,7 @@ timeout: "3600s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
-# Defaults (you can still override in the trigger if desired)
+# Defaults (can still be overridden in the trigger)
 substitutions:
   _REGION: europe-west4
   _TFSTATE_BUCKET: vikunja-case-tfstate
@@ -29,17 +29,17 @@ steps:
           -var="project_id=${PROJECT_ID}" \
           -var="region=${_REGION}"
 
-        # Capture outputs we need later
-        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name 2>/dev/null || echo todo)"
+        # Read outputs (fail fast if cluster name is missing)
+        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)" || { echo "Missing TF output gke_autopilot_name"; exit 1; }
         INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
 
-        # Write an env file for later steps
+        # Write an env file for later steps (NO ${...} here; only $VAR)
         {
           echo "PROJECT_ID=${PROJECT_ID}"
           echo "REGION=${_REGION}"
-          echo "CLUSTER_NAME=$${CLUSTER_NAME}"
-          if [ -n "$${INSTANCE_CONN_NAME}" ]; then
-            echo "INSTANCE_CONN_NAME=$${INSTANCE_CONN_NAME}"
+          echo "CLUSTER_NAME=$CLUSTER_NAME"
+          if [ -n "$INSTANCE_CONN_NAME" ]; then
+            echo "INSTANCE_CONN_NAME=$INSTANCE_CONN_NAME"
           fi
         } > /workspace/env.out
 
@@ -53,11 +53,12 @@ steps:
     args:
       - -ceu
       - |
+        # Load values exported by previous step
         source /workspace/env.out
-        echo "Using cluster: $${CLUSTER_NAME} in $${REGION}, project ${PROJECT_ID}"
+        echo "Using cluster: $CLUSTER_NAME in $REGION, project ${PROJECT_ID}"
 
         # Get kubeconfig for this step
-        gcloud container clusters get-credentials "$${CLUSTER_NAME}" --region "$${REGION}" --project "${PROJECT_ID}"
+        gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "${PROJECT_ID}"
 
         # Namespace
         kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
@@ -65,7 +66,7 @@ steps:
         # DB password from Secret Manager -> K8s secret
         DB_PASS=$(gcloud secrets versions access latest --secret=vikunja-db-password --project "${PROJECT_ID}")
         kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=POSTGRES_PASSWORD="$${DB_PASS}" \
+          --from-literal=POSTGRES_PASSWORD="$DB_PASS" \
           --from-literal=POSTGRES_USER="vikunja" \
           --from-literal=POSTGRES_DB="vikunja" \
           --dry-run=client -o yaml | kubectl apply -f -
@@ -74,7 +75,7 @@ steps:
         if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
           JWT=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
           kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$${JWT}"
+            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$JWT"
         fi
 
         # Install Helm
@@ -85,8 +86,8 @@ steps:
 
         # Helm upgrade (pass Cloud SQL instance if present)
         HELM_ARGS="-n vikunja --create-namespace"
-        if [ -n "$${INSTANCE_CONN_NAME:-}" ]; then
-          HELM_ARGS="$HELM_ARGS --set cloudsql.instanceConnectionName=$${INSTANCE_CONN_NAME}"
+        if [ -n "$INSTANCE_CONN_NAME" ]; then
+          HELM_ARGS="$HELM_ARGS --set cloudsql.instanceConnectionName=$INSTANCE_CONN_NAME"
         fi
 
         helm upgrade --install vikunja ./helm/vikunja $HELM_ARGS
