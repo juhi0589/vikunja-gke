@@ -6,7 +6,7 @@ timeout: "3600s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
-# Defaults so you don't *need* trigger substitutions
+# Defaults so you don't need trigger substitutions
 substitutions:
   _REGION: europe-west4
   _TFSTATE_BUCKET: vikunja-case-tfstate
@@ -54,10 +54,10 @@ steps:
       - -ceu
       - |
         source /workspace/env.out
-        echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}"
+        echo "Using cluster: $${CLUSTER_NAME} in $${REGION}, project ${PROJECT_ID}"
 
         # Get kubeconfig for this step
-        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
+        gcloud container clusters get-credentials "$${CLUSTER_NAME}" --region "$${REGION}" --project "${PROJECT_ID}"
 
         # Namespace
         kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
@@ -85,8 +85,8 @@ steps:
 
         # Helm upgrade (pass Cloud SQL instance if present)
         HELM_ARGS="-n vikunja --create-namespace"
-        if [ -n "${INSTANCE_CONN_NAME:-}" ]; then
-          HELM_ARGS="${HELM_ARGS} --set cloudsql.instanceConnectionName=${INSTANCE_CONN_NAME}"
+        if [ -n "$${INSTANCE_CONN_NAME:-}" ]; then
+          HELM_ARGS="${HELM_ARGS} --set cloudsql.instanceConnectionName=$${INSTANCE_CONN_NAME}"
         fi
 
         helm upgrade --install vikunja ./helm/vikunja ${HELM_ARGS}
