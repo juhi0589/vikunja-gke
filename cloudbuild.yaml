@@ -12,10 +12,11 @@ steps:
     args:
       - -c
       - |
-        set -euo pipefail
+        set -eu
         REGION="europe-west4"
         TFSTATE_BUCKET="vikunja-case-tfstate"
-        PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
+        # Cloud Build provides PROJECT_ID as an env var; keep a safe fallback
+        PROJECT_ID="${PROJECT_ID:-vikunja-case}"
 
         cd infra/terraform
 
@@ -31,7 +32,7 @@ steps:
         CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
         INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
 
-        # Persist values for the next step (note the $$ to avoid Cloud Build subs)
+        # Persist values for the next step (use $$ to keep Cloud Build from touching them)
         {
           echo "PROJECT_ID=$$PROJECT_ID"
           echo "REGION=$$REGION"
