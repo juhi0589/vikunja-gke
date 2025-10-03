@@ -1,91 +1,135 @@
-# Cloud Build: Terraform (GKE + Cloud SQL) -> K8s secrets -> Helm (Vikunja) running successfully finally v1
-# Project: vikunja-case (717226960827) | Region: europe-west4
-timeout: "3600s"
-options:
-  logging: CLOUD_LOGGING_ONLY
+############################################
+# main.tf  —  vikunja-case / europe-west4 #
+############################################
 
-steps:
-  # 1) Terraform init/apply (GCS backend), then write outputs to /workspace/env.out
-  - id: "terraform apply + outputs"
-    name: "hashicorp/terraform:1.9.6"
-    entrypoint: "sh"
-    args:
-      - -c
-      - |
-        set -eu
-        REGION="europe-west4"
-        TFSTATE_BUCKET="vikunja-case-tfstate"
-        # Cloud Build provides PROJECT_ID env automatically
-        PROJECT_ID="${PROJECT_ID:-vikunja-case}"
+# Assumes:
+# - providers.tf sets google/google-beta with project = var.project_id, region = var.region
+# - backend.tf configures the GCS backend
+# - variables.tf defines var.project_id and var.region
+# - outputs.tf exports gke_autopilot_name from this cluster
 
-        cd infra/terraform
+locals {
+  cluster_name = "vikunja-autopilot"
+  sql_name     = "vikunja-pg"
+  db_name      = "vikunja"
+  db_user      = "vikunja"
+}
 
-        terraform init -input=false \
-          -backend-config="bucket=$$TFSTATE_BUCKET" \
-          -backend-config="prefix=vikunja/state"
+#############################
+# GKE Autopilot (regional)  #
+#############################
+resource "google_container_cluster" "autopilot" {
+  name             = local.cluster_name
+  location         = var.region
+  enable_autopilot = true
 
-        terraform apply -input=false -auto-approve \
-          -var="project_id=$$PROJECT_ID" \
-          -var="region=$$REGION"
+  # Keep accidental deletes blocked (we avoid replacements via ignore_changes below)
+  deletion_protection = true
 
-        # Read outputs (require cluster; SQL is optional)
-        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
-        INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
+  # Prevent Terraform from trying to "unset" Autopilot-managed/computed fields
+  lifecycle {
+    ignore_changes = [
+      # Autopilot-surfaced pools & defaults
+      node_pool,
+      node_pool_defaults,
+      node_pool_auto_config,
 
-        {
-          echo "PROJECT_ID=$$PROJECT_ID"
-          echo "REGION=$$REGION"
-          echo "CLUSTER_NAME=$$CLUSTER_NAME"
-          if [ -n "$$INSTANCE_CONN_NAME" ]; then
-            echo "INSTANCE_CONN_NAME=$$INSTANCE_CONN_NAME"
-          fi
-        } > /workspace/env.out
+      # Control-plane / cluster-level configs that drift or are managed by GKE
+      logging_config,
+      monitoring_config,
+      release_channel,
+      workload_identity_config,
+      pod_autoscaling,
+      vertical_pod_autoscaling,
+      gateway_api_config,
+      security_posture_config,
+      service_external_ips_config,
+      notification_config,
+      addons_config,
+      confidential_nodes,
+      ip_allocation_policy,
+      master_authorized_networks_config,
+      mesh_certificates,
+      rbac_binding_config,
+      default_snat_status,
+      private_cluster_config,
+      enterprise_config,
+      identity_service_config,
+      gke_auto_upgrade_config,
+      cost_management_config,
+      database_encryption,
+    ]
+  }
+}
 
-        echo "Wrote /workspace/env.out:"
-        cat /workspace/env.out
+##################################
+# Cloud SQL Postgres (public IP) #
+##################################
 
-  # 2) Get GKE creds, create secrets, install Helm chart
-  - id: "kubectl + helm deploy"
-    name: "gcr.io/cloud-builders/gcloud"
-    entrypoint: "bash"
-    args:
-      - -ceu
-      - |
-        set -euo pipefail
-        source /workspace/env.out
-        echo "Using cluster: $$CLUSTER_NAME in $$REGION, project $$PROJECT_ID"
+# Strong password for DB user (use 'override_special' with random provider v3)
+resource "random_password" "db" {
+  length           = 24
+  special          = true
+  override_special = "!@#%^*-_=+"
+}
 
-        # Kubeconfig (gcloud builder image includes kubectl)
-        gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION" --project "$$PROJECT_ID"
+resource "google_sql_database_instance" "pg" {
+  name             = local.sql_name
+  database_version = "POSTGRES_15"
+  region           = var.region
 
-        # Namespace
-        kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
+  settings {
+    tier              = "db-custom-1-3840"  # 1 vCPU / 3.75 GB (adjust if needed)
+    availability_type = "ZONAL"
 
-        # DB password from Secret Manager -> K8s Secret
-        DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "$$PROJECT_ID")"
-        kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=POSTGRES_PASSWORD="$$DB_PASS" \
-          --from-literal=POSTGRES_USER="vikunja" \
-          --from-literal=POSTGRES_DB="vikunja" \
-          --dry-run=client -o yaml | kubectl apply -f -
+    ip_configuration {
+      ipv4_enabled = true
+    }
 
-        # App JWT (create once)
-        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
-          JWT="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-          kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$$JWT"
-        fi
+    backup_configuration {
+      enabled = true
+    }
+  }
+}
 
-        # Install Helm
-        curl -sSL "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz" -o /tmp/helm.tgz
-        tar -xzf /tmp/helm.tgz -C /tmp
-        mv /tmp/linux-amd64/helm /usr/local/bin/helm
-        helm version
+resource "google_sql_database" "vikunja" {
+  name     = local.db_name
+  instance = google_sql_database_instance.pg.name
+}
 
-        # Helm upgrade (inject Cloud SQL instance if present)
-        HELM_ARGS="-n vikunja --create-namespace"
-        if [ -n "$$INSTANCE_CONN_NAME" ]; then
-          HELM_ARGS="$$HELM_ARGS --set cloudsql.instanceConnectionName=$$INSTANCE_CONN_NAME"
-        fi
+resource "google_sql_user" "vikunja" {
+  name     = local.db_user
+  instance = google_sql_database_instance.pg.name
+  password = random_password.db.result
+}
 
-        helm upgrade --install vikunja ./helm/vikunja $$HELM_ARGS
+#######################################
+# Secret Manager: DB password storage #
+#######################################
+resource "google_secret_manager_secret" "db_password" {
+  secret_id = "vikunja-db-password"
+
+  replication {
+    # Provider v7+: 'auto {}' replaces the old 'automatic = true'
+    auto {}
+  }
+
+  labels = {
+    app = "vikunja"
+  }
+}
+
+resource "google_secret_manager_secret_version" "db_password_version" {
+  secret      = google_secret_manager_secret.db_password.id
+  secret_data = random_password.db.result
+}
+
+########################
+# Required TF outputs  #
+########################
+
+# Used by Cloud Build step 2 to wire Cloud SQL into Helm if present
+output "instance_connection_name" {
+  value       = google_sql_database_instance.pg.connection_name
+  description = "Cloud SQL instance connection name (PROJECT:REGION:INSTANCE)"
+}
