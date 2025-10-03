@@ -6,7 +6,7 @@ timeout: "3600s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
-# Defaults so you don't need trigger substitutions
+# Defaults (you can still override in the trigger if desired)
 substitutions:
   _REGION: europe-west4
   _TFSTATE_BUCKET: vikunja-case-tfstate
@@ -37,9 +37,9 @@ steps:
         {
           echo "PROJECT_ID=${PROJECT_ID}"
           echo "REGION=${_REGION}"
-          echo "CLUSTER_NAME=${CLUSTER_NAME}"
-          if [ -n "${INSTANCE_CONN_NAME}" ]; then
-            echo "INSTANCE_CONN_NAME=${INSTANCE_CONN_NAME}"
+          echo "CLUSTER_NAME=$${CLUSTER_NAME}"
+          if [ -n "$${INSTANCE_CONN_NAME}" ]; then
+            echo "INSTANCE_CONN_NAME=$${INSTANCE_CONN_NAME}"
           fi
         } > /workspace/env.out
 
@@ -86,7 +86,7 @@ steps:
         # Helm upgrade (pass Cloud SQL instance if present)
         HELM_ARGS="-n vikunja --create-namespace"
         if [ -n "$${INSTANCE_CONN_NAME:-}" ]; then
-          HELM_ARGS="${HELM_ARGS} --set cloudsql.instanceConnectionName=$${INSTANCE_CONN_NAME}"
+          HELM_ARGS="$HELM_ARGS --set cloudsql.instanceConnectionName=$${INSTANCE_CONN_NAME}"
         fi
 
-        helm upgrade --install vikunja ./helm/vikunja ${HELM_ARGS}
+        helm upgrade --install vikunja ./helm/vikunja $HELM_ARGS
