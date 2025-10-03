@@ -1,52 +1,49 @@
+# Cloud Build: Terraform (GKE Autopilot + Cloud SQL) -> K8s secrets -> Helm (Vikunja)
+# Project: vikunja-case | Region: europe-west4
 timeout: "3600s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
+  # 1) Terraform init/apply (GCS backend), then write outputs to /workspace/env.out
   - id: "terraform apply + outputs"
     name: "hashicorp/terraform:1.9.6"
-    entrypoint: "bash"
-    # Make built-ins/custom subs available to the script as env vars
-    env:
-      - PROJECT_ID=$PROJECT_ID
-      - REGION=europe-west4
-      - CLUSTER_NAME=vikunja-autopilot
-      - TFSTATE_BUCKET=${_TFSTATE_BUCKET}
+    entrypoint: "sh"
     args:
-      - -ceu
+      - -c
       - |
-        set -euo pipefail
-
-        # Fallback if custom substitution not set
-        TFSTATE_BUCKET="${TFSTATE_BUCKET:-${PROJECT_ID}-tfstate}"
+        set -eu
+        REGION="europe-west4"
+        TFSTATE_BUCKET="vikunja-case-tfstate"
+        PROJECT_ID="${PROJECT_ID:-vikunja-case}"
 
         cd infra/terraform
 
         terraform init -input=false \
-          -backend-config="bucket=${TFSTATE_BUCKET}" \
+          -backend-config="bucket=$$TFSTATE_BUCKET" \
           -backend-config="prefix=vikunja/state"
 
-        # Clear any taint by re-importing the live cluster (no-op if absent)
-        if terraform state list | grep -q '^google_container_cluster\.autopilot$'; then
-          terraform state rm google_container_cluster.autopilot || true
-        fi
-        terraform import google_container_cluster.autopilot \
-          "projects/${PROJECT_ID}/locations/${REGION}/clusters/${CLUSTER_NAME}" || true
-
         terraform apply -input=false -auto-approve \
-          -var="project_id=${PROJECT_ID}" \
-          -var="region=${REGION}"
+          -var="project_id=$$PROJECT_ID" \
+          -var="region=$$REGION"
 
-        # Save outputs/env for next step
+        # Read outputs (cluster required; SQL optional)
+        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
         INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
-        {
-          echo "PROJECT_ID=${PROJECT_ID}"
-          echo "REGION=${REGION}"
-          echo "CLUSTER_NAME=${CLUSTER_NAME}"
-          [ -n "${INSTANCE_CONN_NAME}" ] && echo "INSTANCE_CONN_NAME=${INSTANCE_CONN_NAME}"
-        } > /workspace/env.out
-        echo "=== env.out ==="; cat /workspace/env.out
 
+        {
+          echo "PROJECT_ID=$$PROJECT_ID"
+          echo "REGION=$$REGION"
+          echo "CLUSTER_NAME=$$CLUSTER_NAME"
+          if [ -n "$$INSTANCE_CONN_NAME" ]; then
+            echo "INSTANCE_CONN_NAME=$$INSTANCE_CONN_NAME"
+          fi
+        } > /workspace/env.out
+
+        echo "Wrote /workspace/env.out:"
+        cat /workspace/env.out
+
+  # 2) Get GKE creds, create secrets, install Helm chart
   - id: "kubectl + helm deploy"
     name: "gcr.io/cloud-builders/gcloud"
     entrypoint: "bash"
@@ -55,41 +52,49 @@ steps:
       - |
         set -euo pipefail
         source /workspace/env.out
-        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
+        echo "Using cluster: $$CLUSTER_NAME in $$REGION, project $$PROJECT_ID"
 
+        # Kubeconfig
+        gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION" --project "$$PROJECT_ID"
+
+        # Namespace
         kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
 
-        DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "${PROJECT_ID}")"
+        # DB password from Secret Manager -> K8s Secret
+        DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "$$PROJECT_ID")"
         kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=POSTGRES_PASSWORD="${DB_PASS}" \
+          --from-literal=POSTGRES_PASSWORD="$$DB_PASS" \
           --from-literal=POSTGRES_USER="vikunja" \
           --from-literal=POSTGRES_DB="vikunja" \
           --dry-run=client -o yaml | kubectl apply -f -
 
+        # App JWT (create once)
         if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
           JWT="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
           kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="${JWT}"
+            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$$JWT"
         fi
 
-        mkdir -p /workspace/bin
-        curl -sSL "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz" -o /workspace/helm.tgz
-        tar -xzf /workspace/helm.tgz -C /workspace
-        mv /workspace/linux-amd64/helm /workspace/bin/helm
-        chmod +x /workspace/bin/helm
-        /workspace/bin/helm version
+        # Install Helm (in the gcloud builder)
+        curl -sSL "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz" -o /tmp/helm.tgz
+        tar -xzf /tmp/helm.tgz -C /tmp
+        mv /tmp/linux-amd64/helm /usr/local/bin/helm
+        helm version
 
+        # Helm upgrade (inject Cloud SQL instance if present)
         HELM_ARGS="-n vikunja --create-namespace"
-        if [ -n "${INSTANCE_CONN_NAME:-}" ]; then
-          HELM_ARGS="${HELM_ARGS} --set cloudsql.instanceConnectionName=${INSTANCE_CONN_NAME}"
+        if [ -n "$$INSTANCE_CONN_NAME" ]; then
+          HELM_ARGS="$$HELM_ARGS --set cloudsql.instanceConnectionName=$$INSTANCE_CONN_NAME"
         fi
-        /workspace/bin/helm upgrade --install vikunja ./helm/vikunja ${HELM_ARGS}
 
+        helm upgrade --install vikunja ./helm/vikunja $$HELM_ARGS
+
+        # (Optional) Print external IP when ready
         echo "Waiting for vikunja service external IP..."
         for i in {1..30}; do
           EXTERNAL_IP="$(kubectl -n vikunja get svc -l app.kubernetes.io/name=vikunja -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-          if [ -n "${EXTERNAL_IP}" ]; then
-            echo "Vikunja should be reachable at: http://${EXTERNAL_IP}/"
+          if [ -n "$$EXTERNAL_IP" ]; then
+            echo "Vikunja is likely reachable at: http://$$EXTERNAL_IP/"
             break
           fi
           sleep 10
