@@ -1,64 +1,92 @@
-substitutions:
-  _PROJECT_ID: ${PROJECT_ID}
-  _REGION: europe-west4
-  _TFSTATE_BUCKET: ""
+# Cloud Build pipeline: Terraform (GKE + Cloud SQL + secrets) -> Helm (Vikunja)
+# Project: vikunja-case (717226960827)
+# Region: europe-west4
 
+timeout: "3600s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
+# Defaults so you don't *need* trigger substitutions
+substitutions:
+  _REGION: europe-west4
+  _TFSTATE_BUCKET: vikunja-case-tfstate
+
 steps:
-# Terraform apply (infra)
-- name: hashicorp/terraform:1.6.6
-  id: Terraform Apply
-  entrypoint: sh
-  args:
-    - -ceu
-    - |
-      cd infra/terraform
-      terraform init -backend-config="bucket=${_TFSTATE_BUCKET}" -backend-config="prefix=vikunja/state"
-      terraform apply -auto-approve -var="project_id=${_PROJECT_ID}" -var="region=${_REGION}"
-      echo INSTANCE_CONN_NAME=$(terraform output -raw instance_connection_name) >> /workspace/env.out
+  # 1) Terraform init/apply with GCS backend, then write outputs to /workspace/env.out
+  - id: "terraform apply + outputs"
+    name: "hashicorp/terraform:1.9.6"
+    entrypoint: "bash"
+    args:
+      - -ceu
+      - |
+        cd infra/terraform
 
-# Get cluster credentials
-- name: gcr.io/cloud-builders/gcloud
-  id: Get GKE Credentials
-  args:
-    [
-      "container","clusters","get-credentials","todo",
-      "--region","${_REGION}",
-      "--project","${_PROJECT_ID}"
-    ]
+        terraform init -input=false \
+          -backend-config="bucket=${_TFSTATE_BUCKET}" \
+          -backend-config="prefix=vikunja/state"
 
-# Prepare namespace and secrets (DB creds from Secret Manager + app JWT)
-- name: gcr.io/cloud-builders/gcloud
-  id: Prepare K8s Secrets
-  entrypoint: bash
-  args:
-    - -ceu
-    - |
-      source /workspace/env.out
-      kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
+        terraform apply -input=false -auto-approve \
+          -var="project_id=${PROJECT_ID}" \
+          -var="region=${_REGION}"
 
-      DB_PASS=$(gcloud secrets versions access latest --secret=vikunja-db-password --project ${_PROJECT_ID})
-      kubectl -n vikunja create secret generic vikunja-db-secret         --from-literal=POSTGRES_PASSWORD="${DB_PASS}"         --from-literal=POSTGRES_USER="vikunja"         --from-literal=POSTGRES_DB="vikunja"         --dry-run=client -o yaml | kubectl apply -f -
+        # Capture outputs we need later
+        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name 2>/dev/null || echo todo)"
+        INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
 
-      if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
-        JWT=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        kubectl -n vikunja create secret generic vikunja-app-secret           --from-literal=VIKUNJA_SERVICE_JWTSECRET="${JWT}"
-      fi
+        # Write an env file for later steps
+        {
+          echo "PROJECT_ID=${PROJECT_ID}"
+          echo "REGION=${_REGION}"
+          echo "CLUSTER_NAME=${CLUSTER_NAME}"
+          if [ -n "${INSTANCE_CONN_NAME}" ]; then
+            echo "INSTANCE_CONN_NAME=${INSTANCE_CONN_NAME}"
+          fi
+        } > /workspace/env.out
 
-# Helm deploy (uses upstream Vikunja images)
-- name: alpine/helm:3.12.3
-  id: Helm Upgrade
-  entrypoint: sh
-  args:
-    - -ceu
-    - |
-      source /workspace/env.out
-      helm upgrade --install vikunja ./helm/vikunja         --namespace vikunja         --set gsaEmail=vikunja-sql@${_PROJECT_ID}.iam.gserviceaccount.com         --set cloudsql.instanceConnectionName="${INSTANCE_CONN_NAME}"
+        echo "Wrote /workspace/env.out:"
+        cat /workspace/env.out
 
-# Wait for rollout
-- name: gcr.io/cloud-builders/kubectl
-  id: Wait for Rollout
-  args:
-    ["-n","vikunja","rollout","status","deploy/vikunja-api","--timeout=300s"]
+  # 2) Get GKE creds, create K8s secrets, install Helm chart
+  - id: "kubectl + helm deploy"
+    name: "gcr.io/cloud-builders/gcloud"
+    entrypoint: "bash"
+    args:
+      - -ceu
+      - |
+        source /workspace/env.out
+        echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}"
+
+        # Get kubeconfig for this step
+        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
+
+        # Namespace
+        kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
+
+        # DB password from Secret Manager -> K8s secret
+        DB_PASS=$(gcloud secrets versions access latest --secret=vikunja-db-password --project "${PROJECT_ID}")
+        kubectl -n vikunja create secret generic vikunja-db-secret \
+          --from-literal=POSTGRES_PASSWORD="$${DB_PASS}" \
+          --from-literal=POSTGRES_USER="vikunja" \
+          --from-literal=POSTGRES_DB="vikunja" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        # App JWT secret (create once)
+        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
+          JWT=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          kubectl -n vikunja create secret generic vikunja-app-secret \
+            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$${JWT}"
+        fi
+
+        # Install Helm
+        curl -sSL "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz" -o /tmp/helm.tgz
+        tar -xzf /tmp/helm.tgz -C /tmp
+        mv /tmp/linux-amd64/helm /usr/local/bin/helm
+        helm version
+
+        # Helm upgrade (pass Cloud SQL instance if present)
+        HELM_ARGS="-n vikunja --create-namespace"
+        if [ -n "${INSTANCE_CONN_NAME:-}" ]; then
+          HELM_ARGS="${HELM_ARGS} --set cloudsql.instanceConnectionName=${INSTANCE_CONN_NAME}"
+        fi
+
+        helm upgrade --install vikunja ./helm/vikunja ${HELM_ARGS}
