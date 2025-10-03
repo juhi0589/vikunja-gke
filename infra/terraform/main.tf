@@ -2,10 +2,6 @@
 # main.tf  —  vikunja-case / europe-west4 #
 ############################################
 
-# NOTE:
-# - Provider + versions are defined in versions.tf (keep them as-is).
-# - Variables project_id and region are defined in variables.tf (keep them as-is).
-
 locals {
   cluster_name = "vikunja-autopilot"
   sql_name     = "vikunja-pg"
@@ -17,22 +13,20 @@ locals {
 # GKE Autopilot (regional)  #
 #############################
 resource "google_container_cluster" "autopilot" {
-  name              = local.cluster_name
-  location          = var.region
-  enable_autopilot  = true
-
-  # (Optional) Keep the default network; Autopilot manages node pools.
-  # release_channel { channel = "REGULAR" }
+  name             = local.cluster_name
+  location         = var.region
+  enable_autopilot = true
 }
 
 ##################################
 # Cloud SQL Postgres (public IP) #
 ##################################
-# Random password for the DB user; also stored in Secret Manager.
+
+# Strong password for DB user; NOTE: use override_special (not override_characters)
 resource "random_password" "db" {
   length           = 24
   special          = true
-  override_characters = "!@#%^*-_=+"
+  override_special = "!@#%^*-_=+"
 }
 
 resource "google_sql_database_instance" "pg" {
@@ -41,12 +35,11 @@ resource "google_sql_database_instance" "pg" {
   region           = var.region
 
   settings {
-    tier               = "db-custom-1-3840" # 1 vCPU / 3.75 GB (adjust as needed)
-    availability_type  = "ZONAL"
+    tier              = "db-custom-1-3840" # 1 vCPU / 3.75 GB (adjust if needed)
+    availability_type = "ZONAL"
 
     ip_configuration {
-      ipv4_enabled = true       # Using Cloud SQL Auth Proxy with public IP is fine
-      # private_network = ...   # (optional) if you later switch to private IP
+      ipv4_enabled = true
     }
 
     backup_configuration {
@@ -73,7 +66,7 @@ resource "google_secret_manager_secret" "db_password" {
   secret_id = "vikunja-db-password"
 
   replication {
-    # Provider v7+: use 'auto {}' (old 'automatic = true' is invalid)
+    # Provider v7+: use auto {}    (old 'automatic = true' is invalid)
     auto {}
   }
 
@@ -91,8 +84,8 @@ resource "google_secret_manager_secret_version" "db_password_version" {
 # Required TF outputs  #
 ########################
 
-# Cloud Build step 2 reads this to run the Cloud SQL Proxy / Helm values
+# Cloud Build step 2 reads this to inject into Helm if present
 output "instance_connection_name" {
-  value = google_sql_database_instance.pg.connection_name
+  value       = google_sql_database_instance.pg.connection_name
   description = "Cloud SQL instance connection name (PROJECT:REGION:INSTANCE)"
 }
