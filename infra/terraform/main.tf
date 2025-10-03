@@ -1,99 +1,98 @@
-provider "google" {
-  project = var.project_id
-  region  = var.region
+############################################
+# main.tf  —  vikunja-case / europe-west4 #
+############################################
+
+# NOTE:
+# - Provider + versions are defined in versions.tf (keep them as-is).
+# - Variables project_id and region are defined in variables.tf (keep them as-is).
+
+locals {
+  cluster_name = "vikunja-autopilot"
+  sql_name     = "vikunja-pg"
+  db_name      = "vikunja"
+  db_user      = "vikunja"
 }
 
-# Enable necessary APIs
-resource "google_project_service" "service" {
-  for_each = toset([
-    "artifactregistry.googleapis.com",
-    "cloudbuild.googleapis.com",
-    "container.googleapis.com",
-    "secretmanager.googleapis.com",
-    "sqladmin.googleapis.com",
-    "iam.googleapis.com",
-    "serviceusage.googleapis.com"
-  ])
-  project = var.project_id
-  service = each.key
-}
-
-# GKE Autopilot cluster
+#############################
+# GKE Autopilot (regional)  #
+#############################
 resource "google_container_cluster" "autopilot" {
-  name             = "todo"
-  location         = var.region
-  enable_autopilot = true
-  deletion_protection = false
+  name              = local.cluster_name
+  location          = var.region
+  enable_autopilot  = true
+
+  # (Optional) Keep the default network; Autopilot manages node pools.
+  # release_channel { channel = "REGULAR" }
 }
 
-# Cloud SQL Postgres (public IP; proxy handles secure access)
+##################################
+# Cloud SQL Postgres (public IP) #
+##################################
+# Random password for the DB user; also stored in Secret Manager.
+resource "random_password" "db" {
+  length           = 24
+  special          = true
+  override_characters = "!@#%^*-_=+"
+}
+
 resource "google_sql_database_instance" "pg" {
-  name             = "vikunja-db"
+  name             = local.sql_name
+  database_version = "POSTGRES_15"
   region           = var.region
-  database_version = "POSTGRES_14"
+
   settings {
-    tier = "db-custom-1-3840"
+    tier               = "db-custom-1-3840" # 1 vCPU / 3.75 GB (adjust as needed)
+    availability_type  = "ZONAL"
+
     ip_configuration {
-      ipv4_enabled = true
+      ipv4_enabled = true       # Using Cloud SQL Auth Proxy with public IP is fine
+      # private_network = ...   # (optional) if you later switch to private IP
     }
-    availability_type = "ZONAL"
+
     backup_configuration {
       enabled = true
     }
   }
-  deletion_protection = false
-  depends_on = [google_project_service.service]
 }
 
-resource "google_sql_database" "db" {
-  name     = "vikunja"
+resource "google_sql_database" "vikunja" {
+  name     = local.db_name
   instance = google_sql_database_instance.pg.name
 }
 
-resource "random_password" "dbpass" {
-  length  = 20
-  special = true
-}
-
-resource "google_sql_user" "user" {
+resource "google_sql_user" "vikunja" {
+  name     = local.db_user
   instance = google_sql_database_instance.pg.name
-  name     = "vikunja"
-  password = random_password.dbpass.result
+  password = random_password.db.result
 }
 
-# Store DB password in Secret Manager
+#######################################
+# Secret Manager: DB password storage #
+#######################################
 resource "google_secret_manager_secret" "db_password" {
   secret_id = "vikunja-db-password"
+
   replication {
-    automatic = true
+    # Provider v7+: use 'auto {}' (old 'automatic = true' is invalid)
+    auto {}
+  }
+
+  labels = {
+    app = "vikunja"
   }
 }
 
-resource "google_secret_manager_secret_version" "db_password_v" {
+resource "google_secret_manager_secret_version" "db_password_version" {
   secret      = google_secret_manager_secret.db_password.id
-  secret_data = random_password.dbpass.result
+  secret_data = random_password.db.result
 }
 
-# GSA used by the pod (via Workload Identity) to access Cloud SQL through the proxy
-resource "google_service_account" "vikunja_sql_gsa" {
-  account_id   = "vikunja-sql"
-  display_name = "Vikunja Cloud SQL Client"
-}
+########################
+# Required TF outputs  #
+########################
 
-# Grant Cloud SQL Client role to GSA
-resource "google_project_iam_member" "vikunja_sql_client" {
-  project = var.project_id
-  role    = "roles/cloudsql.client"
-  member  = "serviceAccount:${google_service_account.vikunja_sql_gsa.email}"
-}
-
-# Allow KSA vikunja/vikunja-api to impersonate GSA (Workload Identity)
-resource "google_service_account_iam_member" "wi_bind" {
-  service_account_id = google_service_account.vikunja_sql_gsa.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:${var.project_id}.svc.id.goog[vikunja/vikunja-api]"
-}
-
+# Cloud Build step 2 reads this to run the Cloud SQL Proxy / Helm values
 output "instance_connection_name" {
   value = google_sql_database_instance.pg.connection_name
+  description = "Cloud SQL instance connection name (PROJECT:REGION:INSTANCE)"
 }
