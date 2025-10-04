@@ -41,8 +41,9 @@ steps:
     args:
       - -ceu
       - |
+        DBPASS="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
         kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=postgresql-password="$$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
+          --from-literal=postgresql-password="${DBPASS}" \
           --dry-run=client -o yaml | kubectl apply -f -
 
   # 3) Download Helm (no registry pull) and deploy the local chart at ./helm/vikunja
@@ -70,8 +71,10 @@ steps:
         # Ensure the chart exists at ./helm/vikunja
         test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
 
-        # Deploy/upgrade
-       /workspace/helm upgrade --install vikunja ./helm/vikunja \
-  --namespace vikunja --create-namespace \
-  --set-string db.password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
-  --wait --timeout 15m
+        # Deploy/upgrade with values file; only the DB password comes from Secret Manager
+        DBPASS="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
+        /workspace/bin/helm upgrade --install vikunja ./helm/vikunja \
+          --namespace vikunja --create-namespace \
+          -f ./helm/vikunja/values.yaml \
+          --set-string db.password="${DBPASS}" \
+          --wait --timeout 15m
