@@ -29,10 +29,10 @@ steps:
   id: kubectl + helm deploy
   entrypoint: /bin/bash
   args:
-    - -euxo
-    - pipefail
     - -c
     - |
+      set -euo pipefail
+
       # Load values exported by step #0
       source /workspace/env.out
 
@@ -42,7 +42,7 @@ steps:
       # Create namespace if missing
       kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
 
-      # Make the namespace Helm-managed (this fixes the error you saw)
+      # Make the namespace Helm-managed (fixes the 'invalid ownership metadata' error)
       kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
       kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
       kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
@@ -53,7 +53,7 @@ steps:
         --from-literal=POSTGRES_PASSWORD="${DB_PASS}" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      # (Optional dummy app secret to keep parity with your earlier logs)
+      # (Optional) app secret to match your previous setup
       kubectl -n vikunja create secret generic vikunja-app-secret \
         --from-literal=DUMMY="ok" \
         --dry-run=client -o yaml | kubectl apply -f -
@@ -76,5 +76,13 @@ steps:
   args:
     - -c
     - |
+      set -euo pipefail
       source /workspace/env.out
-      gcloud container cluster
+      gcloud container clusters describe "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" >/dev/null && echo "Cluster OK"
+      kubectl get ns vikunja -o yaml | head -n 40 || true
+
+timeout: "3600s"
+
+# ---- Fix for custom service account builds: use Cloud Logging-only ----
+options:
+  logging: CLOUD_LOGGING_ONLY
