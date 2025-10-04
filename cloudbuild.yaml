@@ -1,38 +1,138 @@
-timeout: "1800s"
-options:
-  logging: CLOUD_LOGGING_ONLY
+# cloudbuild.yaml
+timeout: "3600s"
 
 steps:
-  - id: "kubectl + helm deploy"
-    name: gcr.io/cloud-builders/gcloud
+  # 0) Prepare runtime env (no Cloud Build substitutions used)
+  - name: gcr.io/cloud-builders/gcloud
+    id: prepare-env
     entrypoint: bash
     args:
-      - -ceu
+      - -c
       - |
-        set -o pipefail
+        set -euo pipefail
 
-        # Hard-coded since we removed trigger substitutions.
-        PROJECT_ID="vikunja-case"
+        # >>> EDIT THESE TWO IF YOU NEED DIFFERENT VALUES <<<
+        TFSTATE_BUCKET="vikunja-case-tfstate"
         REGION="europe-west4"
-        CLUSTER_NAME="vikunja-autopilot"
+        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-        # Kubeconfig kept in /workspace (shared within this step).
-        export KUBECONFIG=/workspace/kubeconfig
+        echo "Checking bucket: gs://${TFSTATE_BUCKET}"
+        gsutil ls -b gs://${TFSTATE_BUCKET} >/dev/null
 
-        echo "Fetching cluster credentials..."
-        gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
+        # Save runtime env for later steps (persisted in /workspace)
+        cat > /workspace/env.sh <<'EOF'
+        export TFSTATE_BUCKET="vikunja-case-tfstate"
+        export REGION="europe-west4"
+        EOF
 
-        echo "Ensure namespace exists and is Helm-adoptable..."
-        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
-        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
-        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
-        kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
+        chmod +x /workspace/env.sh
+        echo "Wrote /workspace/env.sh"
 
-        echo "Installing Helm 3..."
-        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  # 1) Terraform init/apply using the existing backend & bucket
+  - name: hashicorp/terraform:1.9.6
+    id: terraform-apply
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        . /workspace/env.sh
 
-        echo "Deploying with Helm..."
-        # Adjust path if your chart lives elsewhere.
-        helm upgrade --install vikunja ./infra/helm \
-          --namespace vikunja \
-          --atomic --wait
+        # If your Terraform is elsewhere, adjust this path:
+        TFDIR="./infra/terraform"
+        echo "Using Terraform directory: ${TFDIR}"
+
+        cd "${TFDIR}"
+
+        terraform init \
+          -input=false \
+          -reconfigure \
+          -backend-config="bucket=${TFSTATE_BUCKET}"
+
+        terraform apply -auto-approve -input=false
+
+        # Capture outputs for later steps (if defined)
+        terraform output -raw gke_autopilot_name > /workspace/cluster_name 2>/dev/null || echo -n "vikunja-autopilot" > /workspace/cluster_name
+        terraform output -raw instance_connection_name > /workspace/instance_conn 2>/dev/null || true
+
+  # 2) Get kubeconfig and prep namespace + secrets
+  - name: gcr.io/cloud-builders/gcloud
+    id: kube-setup
+    # Write kubeconfig into /workspace so it persists to next step
+    env:
+      - HOME=/workspace
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        . /workspace/env.sh
+
+        CLUSTER_NAME="$(cat /workspace/cluster_name || echo vikunja-autopilot)"
+        echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project: ${PROJECT_ID}"
+
+        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
+
+        # Create/label namespace so Helm can adopt it (prevents the ownership error)
+        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create namespace vikunja
+        kubectl label namespace vikunja app.kubernetes.io/managed-by=Helm --overwrite
+        kubectl annotate namespace vikunja meta.helm.sh/release-name=vikunja --overwrite
+        kubectl annotate namespace vikunja meta.helm.sh/release-namespace=vikunja --overwrite
+
+        # Create K8s secrets (DB password from Secret Manager, if available)
+        set +e
+        DB_PW="$(gcloud secrets versions access latest --secret vikunja-db-password 2>/dev/null)"
+        set -e
+        if [ -z "${DB_PW}" ]; then
+          echo "No GSM secret found; generating a random DB password."
+          DB_PW="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+        fi
+
+        kubectl -n vikunja create secret generic vikunja-db-secret \
+          --dry-run=client -o yaml \
+          --from-literal=POSTGRES_DB=vikunja \
+          --from-literal=POSTGRES_USER=vikunja \
+          --from-literal=POSTGRES_PASSWORD="${DB_PW}" \
+        | kubectl apply -f -
+
+        # App secret (JWT / API secret)
+        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1 ; then
+          APP_SECRET="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          kubectl -n vikunja create secret generic vikunja-app-secret \
+            --from-literal=VIKUNJA_SERVICE_JWTSECRET="${APP_SECRET}"
+        fi
+
+  # 3) Helm deploy (use a reliable image & shared kubeconfig via HOME=/workspace)
+  - name: alpine/helm:3.14.4
+    id: helm-deploy
+    env:
+      - HOME=/workspace
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -euo pipefail
+
+        # Decide chart source:
+        # Prefer local chart if present, else fall back to official OCI chart.
+        if [ -d "./infra/helm" ]; then
+          CHART="./infra/helm"
+        elif [ -d "./helm" ]; then
+          CHART="./helm"
+        else
+          CHART="oci://ghcr.io/vikunja/helm/vikunja"
+        fi
+
+        # If using OCI chart, ensure repo login not needed (public)
+        echo "Deploying chart: ${CHART}"
+        helm version
+
+        # Common flags
+        HELM_FLAGS="--namespace vikunja --create-namespace --install --wait --timeout 15m"
+
+        # Example values overrides (add/adjust as needed)
+        # helm upgrade vikunja "$CHART" $HELM_FLAGS -f infra/helm/values.yaml
+        helm upgrade vikunja "$CHART" $HELM_FLAGS
+
+# No non-built-in substitutions used in this file
+# (We only rely on built-in $PROJECT_ID which Cloud Build always provides)
