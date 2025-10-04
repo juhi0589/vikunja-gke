@@ -1,15 +1,14 @@
 # cloudbuild.yaml
 
-# ---- important: this satisfies the "logging options required" error ----
 options:
+  # Satisfies the logging requirement even when a user-managed SA is used
   logging: CLOUD_LOGGING_ONLY
-  # (optional but harmless; works fine with a custom SA too)
   default_logs_bucket_behavior: REGIONAL_USER_OWNED_BUCKET
 
 timeout: "3600s"
 
 steps:
-# 1) Terraform apply and write outputs for later steps
+# ---- 1) Terraform apply & capture outputs for later steps ----
 - id: "terraform apply + outputs"
   name: "hashicorp/terraform:1.9.6"
   entrypoint: /bin/sh
@@ -20,7 +19,7 @@ steps:
       terraform init -input=false
       terraform apply -input=false -auto-approve
 
-      # Write the values we need for the next step
+      # Persist values we need in later steps
       {
         echo "PROJECT_ID=$(terraform output -raw project_id)"
         echo "REGION=$(terraform output -raw region)"
@@ -31,7 +30,7 @@ steps:
       echo "---- env.out ----"
       cat /workspace/env.out
 
-# 2) Connect to GKE and deploy with Helm
+# ---- 2) Connect to GKE and deploy with Helm ----
 - id: "kubectl + helm deploy"
   name: "gcr.io/cloud-builders/gcloud"
   entrypoint: /bin/bash
@@ -44,14 +43,14 @@ steps:
       echo "Using cluster: $CLUSTER_NAME in region $REGION (project $PROJECT_ID)"
       gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
 
-      # If Helm isn't already available in this builder image, uncomment the 3 lines below:
+      # If helm isn't present in this builder, uncomment the lines below to install it:
       # HELM_VER="v3.14.4"
       # curl -sSL "https://get.helm.sh/helm-${HELM_VER}-linux-amd64.tar.gz" | tar -xz
       # mv linux-amd64/helm /usr/local/bin/helm
 
       helm version
 
-      # Idempotent secrets (apply instead of create to avoid errors on re-runs)
+      # Secrets (idempotent)
       DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "$PROJECT_ID")"
 
       kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
@@ -68,13 +67,11 @@ steps:
         --from-literal=VIKUNJA_JWT_SECRET="$JWT_SECRET" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      # >>>> IMPORTANT: set CHART_PATH to where your Helm chart lives in the repo <<<<
+      # Path to your chart in the repo:
       CHART_PATH="./helm/vikunja"
 
-      # Install/upgrade. --create-namespace prevents the earlier ownership error.
+      # Install/upgrade and let Helm own the namespace (prevents ownership label errors)
       helm upgrade --install vikunja "$CHART_PATH" \
         --namespace vikunja \
         --create-namespace \
         --wait
-
-# (no substitutions block needed; we read everything from /workspace/env.out)
