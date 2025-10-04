@@ -1,101 +1,76 @@
-#Running successfully Finally now
-timeout: "1800s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
+volumes:
+  - name: kube
+    path: /kube
+
 steps:
-  - id: prepare-env
-    name: gcr.io/cloud-builders/gcloud
-    entrypoint: bash
-    args:
-      - -c
-      - |
-        set -euo pipefail
+- id: prepare-env
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+    - -euxc
+    - |
+      PROJECT_ID="${PROJECT_ID}"
+      TFSTATE_BUCKET="vikunja-case-tfstate"
+      echo "Checking bucket: gs://${TFSTATE_BUCKET}"
+      gsutil ls -b "gs://${TFSTATE_BUCKET}" >/dev/null
+      cat > /workspace/env.sh <<'EOF'
+      export REGION="europe-west4"
+      export CLUSTER_NAME="vikunja-autopilot"
+      export TFSTATE_BUCKET="vikunja-case-tfstate"
+      export PROJECT_ID="${PROJECT_ID}"
+      export KUBECONFIG="/kube/config"
+      EOF
 
-        PROJECT_ID="$(gcloud config get-value project)"
-        REGION="europe-west4"
-        CLUSTER_NAME="vikunja-autopilot"
-        TFSTATE_BUCKET="$${PROJECT_ID}-tfstate"
-        TFSTATE_PREFIX="gke"
+- id: terraform-apply
+  name: hashicorp/terraform:1.9.6
+  entrypoint: sh
+  args:
+    - -euxc
+    - |
+      . /workspace/env.sh
+      cd infra/terraform
+      terraform init \
+        -backend-config="bucket=${TFSTATE_BUCKET}" \
+        -backend-config="prefix=${PROJECT_ID}/state"
+      terraform apply -auto-approve
 
-        echo "Checking bucket: gs://$${TFSTATE_BUCKET}"
-        gsutil ls -b "gs://$${TFSTATE_BUCKET}" >/dev/null
+- id: k8s-setup
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+    - -euxc
+    - |
+      . /workspace/env.sh
+      export KUBECONFIG="${KUBECONFIG}"
+      gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
 
-        {
-          echo "export PROJECT_ID=$${PROJECT_ID}"
-          echo "export REGION=$${REGION}"
-          echo "export CLUSTER_NAME=$${CLUSTER_NAME}"
-          echo "export TFSTATE_BUCKET=$${TFSTATE_BUCKET}"
-          echo "export TFSTATE_PREFIX=$${TFSTATE_PREFIX}"
-        } > /workspace/env.sh
-        chmod +x /workspace/env.sh
-        echo "Wrote /workspace/env.sh"
+      kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
+      kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
+      kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
+      kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-  - id: terraform-apply
-    name: hashicorp/terraform:1.9.6
-    entrypoint: sh
-    args:
-      - -c
-      - |
-        set -euo pipefail
-        . /workspace/env.sh
+      DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "${PROJECT_ID}")"
+      kubectl -n vikunja create secret generic vikunja-db-secret \
+        --from-literal=VIKUNJA_DATABASE_PASSWORD="${DB_PASS}" \
+        --dry-run=client -o yaml | kubectl apply -f -
+  volumes:
+    - name: kube
+      path: /kube
 
-        test -d infra/terraform || { echo "ERROR: infra/terraform not found"; exit 1; }
-
-        terraform -chdir=infra/terraform init \
-          -input=false \
-          -backend-config="bucket=$${TFSTATE_BUCKET}" \
-          -backend-config="prefix=$${TFSTATE_PREFIX}"
-
-        terraform -chdir=infra/terraform apply -auto-approve -input=false \
-          -var="project_id=$${PROJECT_ID}" \
-          -var="region=$${REGION}"
-
-  - id: k8s-preflight
-    name: gcr.io/cloud-builders/gcloud
-    entrypoint: bash
-    args:
-      - -c
-      - |
-        set -euo pipefail
-        . /workspace/env.sh
-
-        export KUBECONFIG=/workspace/kubeconfig
-
-        echo "Getting cluster credentials..."
-        gcloud container clusters get-credentials "$${CLUSTER_NAME}" --region "$${REGION}"
-
-        echo "Ensure namespace exists and is Helm-adoptable..."
-        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
-        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
-        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
-        kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
-
-        echo "Create/Update secrets..."
-        DB_PASSWORD="$(gcloud secrets versions access latest --secret='vikunja-db-password')"
-        APP_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-
-        kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=POSTGRES_PASSWORD="$$DB_PASSWORD" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
-        kubectl -n vikunja create secret generic vikunja-app-secret \
-          --from-literal=JWT_SECRET="$$APP_SECRET" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
-  - id: helm-deploy
-    name: gcr.io/cloud-builders/helm
-    env:
-      - KUBECONFIG=/workspace/kubeconfig
-    entrypoint: sh
-    args:
-      - -c
-      - |
-        set -euo pipefail
-
-        test -d helm/vikunja || { echo "ERROR: helm/vikunja chart path not found"; exit 1; }
-
-        helm version
-        helm upgrade --install vikunja ./helm/vikunja \
-          --namespace vikunja \
-          --wait --timeout 10m
+- id: helm-deploy
+  name: alpine/helm:3.14.4
+  entrypoint: sh
+  args:
+    - -euxc
+    - |
+      export KUBECONFIG=/kube/config
+      helm repo add vikunja https://vikunja.github.io/helm-charts || true
+      helm repo update
+      helm upgrade --install vikunja vikunja/vikunja \
+        --namespace vikunja --create-namespace
+  volumes:
+    - name: kube
+      path: /kube
