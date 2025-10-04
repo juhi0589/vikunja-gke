@@ -1,48 +1,80 @@
+# cloudbuild.yaml
+
+# ---- important: this satisfies the "logging options required" error ----
+options:
+  logging: CLOUD_LOGGING_ONLY
+  # (optional but harmless; works fine with a custom SA too)
+  default_logs_bucket_behavior: REGIONAL_USER_OWNED_BUCKET
+
 timeout: "3600s"
 
-options:
-  # If your trigger uses a custom service account, this satisfies the logging requirement
-  logging: CLOUD_LOGGING_ONLY
-
 steps:
-  # 0) Terraform: create/keep infra and write outputs for step 1
-  - name: hashicorp/terraform:1.9.6
-    id: terraform-apply-and-outputs
-    entrypoint: sh
-    args:
-      - -c
-      - >
-        set -eu;
-        terraform init -input=false &&
-        terraform apply -auto-approve -input=false &&
-        REGION=europe-west4 &&
-        CLUSTER_NAME=$(terraform output -raw gke_autopilot_name) &&
-        INSTANCE_CONN_NAME=$(terraform output -raw instance_connection_name) &&
-        printf 'PROJECT_ID=%s\nREGION=%s\nCLUSTER_NAME=%s\nINSTANCE_CONN_NAME=%s\n'
-        "$PROJECT_ID" "$REGION" "$CLUSTER_NAME" "$INSTANCE_CONN_NAME" > /workspace/env.out &&
-        echo 'Wrote /workspace/env.out:' &&
-        cat /workspace/env.out
+# 1) Terraform apply and write outputs for later steps
+- id: "terraform apply + outputs"
+  name: "hashicorp/terraform:1.9.6"
+  entrypoint: /bin/sh
+  args:
+    - -c
+    - |
+      set -eux
+      terraform init -input=false
+      terraform apply -input=false -auto-approve
 
-  # 1) Connect to cluster, fix namespace ownership, secrets, then helm install/upgrade
-  - name: gcr.io/cloud-builders/gcloud
-    id: kubectl-and-helm-deploy
-    entrypoint: bash
-    args:
-      - -lc
-      - >
-        set -euo pipefail;
-        source /workspace/env.out;
-        echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}";
-        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}";
-        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja;
-        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite;
-        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite;
-        kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite;
-        DB_PASS=$(gcloud secrets versions access latest --secret=vikunja-db-password);
-        kubectl -n vikunja create secret generic vikunja-db-secret --from-literal=POSTGRES_PASSWORD="${DB_PASS}" --dry-run=client -o yaml | kubectl apply -f -;
-        kubectl -n vikunja create secret generic vikunja-app-secret --from-literal=DUMMY="ok" --dry-run=client -o yaml | kubectl apply -f -;
-        helm repo add vikunja https://vikunja.github.io/helm-charts || true;
-        helm repo update;
-        helm upgrade --install vikunja vikunja/vikunja --namespace vikunja --wait --timeout 20m;
-        kubectl -n vikunja get pods;
-        kubectl -n vikunja get svc
+      # Write the values we need for the next step
+      {
+        echo "PROJECT_ID=$(terraform output -raw project_id)"
+        echo "REGION=$(terraform output -raw region)"
+        echo "CLUSTER_NAME=$(terraform output -raw gke_autopilot_name)"
+        echo "INSTANCE_CONN_NAME=$(terraform output -raw instance_connection_name)"
+      } > /workspace/env.out
+
+      echo "---- env.out ----"
+      cat /workspace/env.out
+
+# 2) Connect to GKE and deploy with Helm
+- id: "kubectl + helm deploy"
+  name: "gcr.io/cloud-builders/gcloud"
+  entrypoint: /bin/bash
+  args:
+    - -ceu
+    - |
+      set -euo pipefail
+      source /workspace/env.out
+
+      echo "Using cluster: $CLUSTER_NAME in region $REGION (project $PROJECT_ID)"
+      gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
+
+      # If Helm isn't already available in this builder image, uncomment the 3 lines below:
+      # HELM_VER="v3.14.4"
+      # curl -sSL "https://get.helm.sh/helm-${HELM_VER}-linux-amd64.tar.gz" | tar -xz
+      # mv linux-amd64/helm /usr/local/bin/helm
+
+      helm version
+
+      # Idempotent secrets (apply instead of create to avoid errors on re-runs)
+      DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "$PROJECT_ID")"
+
+      kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
+
+      kubectl -n vikunja create secret generic vikunja-db-secret \
+        --from-literal=VIKUNJA_DB_HOST="$INSTANCE_CONN_NAME" \
+        --from-literal=VIKUNJA_DB_NAME="vikunja" \
+        --from-literal=VIKUNJA_DB_USER="vikunja" \
+        --from-literal=VIKUNJA_DB_PASSWORD="$DB_PASS" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      JWT_SECRET="$(head -c 32 /dev/urandom | xxd -p)"
+      kubectl -n vikunja create secret generic vikunja-app-secret \
+        --from-literal=VIKUNJA_JWT_SECRET="$JWT_SECRET" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      # >>>> IMPORTANT: set CHART_PATH to where your Helm chart lives in the repo <<<<
+      CHART_PATH="./helm/vikunja"
+
+      # Install/upgrade. --create-namespace prevents the earlier ownership error.
+      helm upgrade --install vikunja "$CHART_PATH" \
+        --namespace vikunja \
+        --create-namespace \
+        --wait
+
+# (no substitutions block needed; we read everything from /workspace/env.out)
