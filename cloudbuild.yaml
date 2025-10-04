@@ -2,7 +2,7 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-# 0) Get cluster credentials (writes kubeconfig to /builder/home/.kube/config)
+# 0) Get cluster creds and persist kubeconfig for later steps
 - id: get-credentials
   name: gcr.io/cloud-builders/gcloud
   entrypoint: bash
@@ -12,12 +12,15 @@ steps:
       gcloud container clusters get-credentials vikunja-autopilot \
         --region europe-west4 \
         --project vikunja-case
+      # keep kubeconfig between steps
+      mkdir -p /workspace/.kube
+      cp -f /builder/home/.kube/config /workspace/.kube/config
 
-# 1) Prepare namespace and make it Helm-adoptable
+# 1) Prepare namespace and make it Helm-adoptable (avoids the ownership error)
 - id: prepare-namespace
   name: gcr.io/cloud-builders/gcloud
   env:
-    - KUBECONFIG=/builder/home/.kube/config
+    - KUBECONFIG=/workspace/.kube/config
   entrypoint: bash
   args:
     - -ceu
@@ -30,7 +33,7 @@ steps:
 - id: create-secrets
   name: gcr.io/cloud-builders/gcloud
   env:
-    - KUBECONFIG=/builder/home/.kube/config
+    - KUBECONFIG=/workspace/.kube/config
   entrypoint: bash
   args:
     - -ceu
@@ -39,17 +42,28 @@ steps:
         --from-literal=postgresql-password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-# 3) Helm deploy using official Helm image (pin version!)
+# 3) Download Helm directly and deploy (no registry pulls)
 - id: helm-deploy
-  name: ghcr.io/helm/helm:v3.14.4
+  name: gcr.io/cloud-builders/gcloud
   env:
-    - KUBECONFIG=/builder/home/.kube/config
-  entrypoint: sh
+    - KUBECONFIG=/workspace/.kube/config
+    - HELM_VERSION=v3.14.4
+  entrypoint: bash
   args:
     - -ceu
     - |
-      helm version
-      # Make sure your chart exists at ./helm/vikunja in the repo
-      helm upgrade --install vikunja ./helm/vikunja \
-        --namespace vikunja --create-namespace \
-        --wait --timeout 10m
+      set -euo pipefail
+      curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /workspace/helm.tgz
+      tar -xzf /workspace/helm.tgz -C /workspace
+      mv /workspace/linux-amd64/helm /workspace/helm && chmod +x /workspace/helm
+      /workspace/helm version
+
+      # Ensure your chart is committed at ./helm/vikunja (it must contain Chart.yaml)
+      if [ -d "./helm/vikunja" ]; then
+        /workspace/helm upgrade --install vikunja ./helm/vikunja \
+          --namespace vikunja --create-namespace \
+          --wait --timeout 15m
+      else
+        echo "ERROR: Chart not found at ./helm/vikunja"
+        exit 1
+      fi
