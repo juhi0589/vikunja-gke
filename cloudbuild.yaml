@@ -1,4 +1,3 @@
-# cloudbuild.yaml (no custom substitutions needed)
 options:
   logging: CLOUD_LOGGING_ONLY
   default_logs_bucket_behavior: REGIONAL_USER_OWNED_BUCKET
@@ -14,24 +13,17 @@ steps:
     - -ceu
     - |
       set -euo pipefail
+
       terraform init -input=false
       terraform apply -input=false -auto-approve
 
-      # Read outputs
+      # Read Terraform outputs
       CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
       INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name)"
-      PROJECT_ID="$PROJECT_ID"   # built-in is OK to use
 
-      # Discover the region from the cluster
-      REGION="$(gcloud container clusters list \
-        --project="${PROJECT_ID}" \
-        --filter="name=$$CLUSTER_NAME" \
-        --format="value(location)")"
-
-      # Persist for next step (escape non-builtins with $$ so CB doesn't substitute)
+      # Persist for the next step
       {
-        echo "PROJECT_ID=${PROJECT_ID}"
-        echo "REGION=$$REGION"
+        echo "PROJECT_ID=${PROJECT_ID}"                  # built-in is allowed
         echo "CLUSTER_NAME=$$CLUSTER_NAME"
         echo "INSTANCE_CONN_NAME=$$INSTANCE_CONN_NAME"
       } > /workspace/env.out
@@ -49,42 +41,39 @@ steps:
       set -euo pipefail
       source /workspace/env.out
 
-      echo "Using cluster $CLUSTER_NAME in $REGION (project $PROJECT_ID)"
-      gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
+      # Discover region for the cluster
+      REGION="$(gcloud container clusters list \
+        --project "$PROJECT_ID" \
+        --filter="name=$$CLUSTER_NAME" \
+        --format="value(location)")"
 
-      # Ensure namespace has Helm ownership labels/annotations (prevents ownership error)
-      cat <<'EOF' | kubectl apply -f -
-      apiVersion: v1
-      kind: Namespace
-      metadata:
-        name: vikunja
-        labels:
-          app.kubernetes.io/managed-by: Helm
-        annotations:
-          meta.helm.sh/release-name: vikunja
-          meta.helm.sh/release-namespace: vikunja
-      EOF
+      echo "Using cluster $$CLUSTER_NAME in $$REGION (project $PROJECT_ID)"
+      gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION" --project "$PROJECT_ID"
+
+      # Ensure namespace exists and is owned by Helm (avoids the ownership error)
+      kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
+      kubectl label namespace vikunja app.kubernetes.io/managed-by=Helm --overwrite
+      kubectl annotate namespace vikunja meta.helm.sh/release-name=vikunja --overwrite
+      kubectl annotate namespace vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
       # Secrets
       DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "$PROJECT_ID")"
 
       kubectl -n vikunja create secret generic vikunja-db-secret \
-        --from-literal=VIKUNJA_DB_HOST="$INSTANCE_CONN_NAME" \
+        --from-literal=VIKUNJA_DB_HOST="$$INSTANCE_CONN_NAME" \
         --from-literal=VIKUNJA_DB_NAME="vikunja" \
         --from-literal=VIKUNJA_DB_USER="vikunja" \
-        --from-literal=VIKUNJA_DB_PASSWORD="$DB_PASS" \
+        --from-literal=VIKUNJA_DB_PASSWORD="$$DB_PASS" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      JWT_SECRET="$(head -c 32 /dev/urandom | xxd -p)"
+      JWT_SECRET="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
       kubectl -n vikunja create secret generic vikunja-app-secret \
-        --from-literal=VIKUNJA_JWT_SECRET="$JWT_SECRET" \
+        --from-literal=VIKUNJA_JWT_SECRET="$$JWT_SECRET" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      # Chart path in repo
-      CHART_PATH="./helm/vikunja"
-
+      # Deploy chart
       helm version
-      helm upgrade --install vikunja "$CHART_PATH" \
+      helm upgrade --install vikunja ./helm/vikunja \
         --namespace vikunja \
         --create-namespace \
         --wait
