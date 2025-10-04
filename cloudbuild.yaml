@@ -1,9 +1,8 @@
-# cloudbuild.yaml
 options:
-  logging: CLOUD_LOGGING_ONLY  # compatible even if your trigger sets a service account
+  logging: CLOUD_LOGGING_ONLY
 
 steps:
-# 0) Get cluster credentials
+# 0) Grab cluster creds (writes kubeconfig to /builder/home/.kube/config, which persists across steps)
 - id: get-credentials
   name: gcr.io/cloud-builders/gcloud
   entrypoint: bash
@@ -14,9 +13,11 @@ steps:
         --region europe-west4 \
         --project vikunja-case
 
-# 1) Ensure namespace exists and is Helm-adoptable
+# 1) Namespace prepared and Helm-adoptable
 - id: prepare-namespace
   name: gcr.io/cloud-builders/gcloud
+  env:
+    - KUBECONFIG=/builder/home/.kube/config
   entrypoint: bash
   args:
     - -ceu
@@ -25,9 +26,11 @@ steps:
       kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
       kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-# 2) Create/refresh DB secret from Secret Manager (no custom $VARs used)
+# 2) Secret from Secret Manager (no custom substitutions)
 - id: create-secrets
   name: gcr.io/cloud-builders/gcloud
+  env:
+    - KUBECONFIG=/builder/home/.kube/config
   entrypoint: bash
   args:
     - -ceu
@@ -36,14 +39,15 @@ steps:
         --from-literal=postgresql-password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-# 3) Helm upgrade/install (chart lives at ./helm/vikunja)
+# 3) Helm deploy using the Helm builder (pin version!)
 - id: helm-deploy
-  name: gcr.io/cloud-builders/gcloud
+  name: gcr.io/cloud-builders/helm:3.14.4
+  env:
+    - KUBECONFIG=/builder/home/.kube/config
   entrypoint: bash
   args:
     - -ceu
     - |
-      helm version
       helm upgrade --install vikunja ./helm/vikunja \
         --namespace vikunja --create-namespace \
         --wait --timeout 10m
