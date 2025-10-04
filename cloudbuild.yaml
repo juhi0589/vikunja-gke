@@ -1,13 +1,10 @@
-# Deploy-only pipeline: gets GKE creds, fixes namespace ownership, creates secrets, deploys with Helm.
-# No custom (non-underscored) substitutions anywhere.
-
 options:
-  logging: CLOUD_LOGGING_ONLY  # satisfies the SA/logging requirement
+  logging: CLOUD_LOGGING_ONLY
 
 timeout: "1200s"
 
 steps:
-# 1) Get kube credentials into a file under /workspace so later steps can use it
+# 1) Get GKE credentials into a kubeconfig under /workspace so later steps can use it
 - id: "get-credentials"
   name: gcr.io/cloud-builders/gcloud
   entrypoint: /bin/sh
@@ -15,56 +12,58 @@ steps:
     - -c
     - |
       set -eu
-      CLUSTER_NAME="vikunja-autopilot"       # <— change if your cluster name is different
-      REGION="europe-west4"                  # <— change if your region is different
+      CLUSTER_NAME="vikunja-autopilot"     # <-- change if different
+      REGION="europe-west4"                # <-- change if different
       export KUBECONFIG=/workspace/kubeconfig
-      gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION"
+      gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION"
 
-# 2) Make sure the namespace exists and is "adoptable" by Helm (prevents the ownership error)
+# 2) Ensure namespace exists and is Helm-adoptable (fixes Helm ownership error)
 - id: "prepare-namespace"
-  name: gcr.io/cloud-builders/kubectl
-  env:
-    - KUBECONFIG=/workspace/kubeconfig
+  name: gcr.io/cloud-builders/gcloud
   entrypoint: /bin/sh
   args:
     - -c
     - |
       set -eu
+      export KUBECONFIG=/workspace/kubeconfig
       NS="vikunja"
-      kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create namespace "$NS"
-      kubectl label namespace "$NS" app.kubernetes.io/managed-by=Helm --overwrite
-      kubectl annotate namespace "$NS" meta.helm.sh/release-name=vikunja meta.helm.sh/release-namespace="$NS" --overwrite
+      kubectl get ns "$$NS" >/dev/null 2>&1 || kubectl create namespace "$$NS"
+      kubectl label namespace "$$NS" app.kubernetes.io/managed-by=Helm --overwrite
+      kubectl annotate namespace "$$NS" meta.helm.sh/release-name=vikunja meta.helm.sh/release-namespace="$$NS" --overwrite
 
-# 3) Create/update the DB password secret in the namespace from Secret Manager
+# 3) Create/update DB password secret from Secret Manager
 - id: "create-secrets"
   name: gcr.io/cloud-builders/gcloud
-  env:
-    - KUBECONFIG=/workspace/kubeconfig
   entrypoint: /bin/sh
   args:
     - -c
     - |
       set -eu
+      export KUBECONFIG=/workspace/kubeconfig
       NS="vikunja"
       DBPASS="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
-      # Apply idempotently
-      kubectl -n "$NS" create secret generic vikunja-db-secret \
+      kubectl -n "$$NS" create secret generic vikunja-db-secret \
         --from-literal=POSTGRES_PASSWORD="$${DBPASS}" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-# 4) Helm deploy (use a public Helm image; cloud-builders/helm:latest does not exist)
+# 4) Install Helm in the gcloud image (so GKE auth works) and deploy
 - id: "helm-deploy"
-  name: alpine/helm:3.14.4
-  env:
-    - KUBECONFIG=/workspace/kubeconfig
+  name: gcr.io/cloud-builders/gcloud
   entrypoint: /bin/sh
   args:
     - -c
     - |
       set -eu
-      # If your chart lives in a different folder, change ./helm below.
+      export KUBECONFIG=/workspace/kubeconfig
+      HELM_VERSION=3.14.4
+      curl -sSL -o /tmp/helm.tar.gz https://get.helm.sh/helm-v$${HELM_VERSION}-linux-amd64.tar.gz
+      tar -C /tmp -xzf /tmp/helm.tar.gz
+      install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+      helm version
+
+      # Adjust path if your chart is not in ./helm
       test -f ./helm/Chart.yaml || { echo "Chart not found at ./helm"; exit 1; }
-      # Optional: pass values here if your chart expects them
+
       helm upgrade --install vikunja ./helm \
         --namespace vikunja \
         --wait --timeout 10m
