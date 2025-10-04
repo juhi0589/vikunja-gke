@@ -1,87 +1,41 @@
-# cloudbuild.yaml — deploy only, no custom substitutions
-
-timeout: "3600s"
-
-options:
-  # If your trigger uses a service_account, this satisfies the logging requirement.
-  logging: CLOUD_LOGGING_ONLY
-
 steps:
-  # 1) Get kubeconfig and prep the namespace so Helm can “own” it
   - name: gcr.io/cloud-builders/gcloud
-    id: kubeconfig-and-namespace
-    env: ["HOME=/workspace"]   # share kubeconfig via /workspace
+    id: get-creds + prep namespace
     entrypoint: bash
     args:
       - -c
       - |
         set -euo pipefail
-
-        # <<< EDIT THESE IF DIFFERENT >>>
         CLUSTER_NAME="vikunja-autopilot"
         REGION="europe-west4"
-        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+        # Get kubeconfig
         gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION"
 
-        # Create namespace (if needed) and make it Helm-adoptable
-        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create namespace vikunja
-        kubectl label namespace vikunja app.kubernetes.io/managed-by=Helm --overwrite
-        kubectl annotate namespace vikunja meta.helm.sh/release-name=vikunja --overwrite
-        kubectl annotate namespace vikunja meta.helm.sh/release-namespace=vikunja --overwrite
+        # Persist kubeconfig for later steps
+        export KUBECONFIG=/workspace/kubeconfig
+        mkdir -p "$(dirname "$KUBECONFIG")"
+        kubectl config view --raw > "$KUBECONFIG"
 
-  # 2) Ensure required secrets (pull DB password from Secret Manager if it exists)
-  - name: gcr.io/cloud-builders/gcloud
-    id: ensure-secrets
-    env: ["HOME=/workspace"]
-    entrypoint: bash
+        # Ensure namespace exists and is Helm-adoptable (prevents the 'invalid ownership metadata' error)
+        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
+        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
+        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
+        kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
+
+  - name: gcr.io/cloud-builders/helm:3.14.4
+    id: helm upgrade/install
+    env:
+      - KUBECONFIG=/workspace/kubeconfig
     args:
-      - -c
-      - |
-        set -euo pipefail
+      - upgrade
+      - --install
+      - vikunja
+      - ./helm/vikunja
+      - --namespace
+      - vikunja
+      - --create-namespace
 
-        # Try to read DB password from Secret Manager (skip if not present)
-        set +e
-        DB_PW="$(gcloud secrets versions access latest --secret vikunja-db-password 2>/dev/null)"
-        set -e
-        if [ -n "${DB_PW}" ]; then
-          kubectl -n vikunja create secret generic vikunja-db-secret \
-            --dry-run=client -o yaml \
-            --from-literal=POSTGRES_DB=vikunja \
-            --from-literal=POSTGRES_USER=vikunja \
-            --from-literal=POSTGRES_PASSWORD="${DB_PW}" | kubectl apply -f -
-        else
-          echo "NOTE: Secret Manager secret 'vikunja-db-password' not found; skipping DB secret creation."
-        fi
-
-        # App secret (JWT) — only create if missing
-        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1 ; then
-          APP_SECRET="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
-          kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="${APP_SECRET}"
-        fi
-
-  # 3) Helm deploy from your repo's chart folder
-  - name: alpine/helm:3.14.4
-    id: helm-upgrade
-    env: ["HOME=/workspace"]
-    entrypoint: sh
-    args:
-      - -c
-      - |
-        set -euo pipefail
-
-        # <<< UPDATE THIS PATH IF YOUR CHART IS ELSEWHERE >>>
-        CHART="./helm"
-        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-        if [ ! -d "$CHART" ]; then
-          echo "Chart directory '$CHART' not found in the repo. Put your chart at ./helm or update CHART path."; exit 1
-        fi
-
-        helm version
-        helm upgrade --install vikunja "$CHART" \
-          --namespace vikunja \
-          --create-namespace \
-          --wait \
-          --timeout 15m
+options:
+  # If your trigger sets a service account, this avoids the logs_bucket requirement.
+  logging: CLOUD_LOGGING_ONLY
