@@ -3,34 +3,33 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-# 0) Prepare env and ensure the tfstate bucket exists
-- id: prepare-env-and-bucket
+# 0) Prepare environment + verify the tfstate bucket exists (no creation here)
+- id: prepare-env
   name: gcr.io/cloud-builders/gcloud
   entrypoint: bash
   args:
     - -c
     - |
       set -euo pipefail
-      PROJECT_ID="$(gcloud config get-value project)"
+      PROJECT_ID="$$(gcloud config get-value project)"
       REGION="europe-west4"
       CLUSTER_NAME="vikunja-autopilot"
-      TFSTATE_BUCKET="${PROJECT_ID}-tfstate"
+      TFSTATE_BUCKET="$$PROJECT_ID-tfstate"
       TFSTATE_PREFIX="gke"
 
-      # Share values with later steps
+      echo "Checking bucket: gs://$$TFSTATE_BUCKET"
+      if ! gcloud storage buckets describe "gs://$$TFSTATE_BUCKET" >/dev/null 2>&1; then
+        echo "ERROR: Bucket gs://$$TFSTATE_BUCKET not found. Create it once and re-run." >&2
+        exit 1
+      fi
+
+      # write env for later steps (Cloud Build rewrites $$ → $ at runtime)
       printf 'export PROJECT_ID=%s\nexport REGION=%s\nexport CLUSTER_NAME=%s\nexport TFSTATE_BUCKET=%s\nexport TFSTATE_PREFIX=%s\n' \
         "$$PROJECT_ID" "$$REGION" "$$CLUSTER_NAME" "$$TFSTATE_BUCKET" "$$TFSTATE_PREFIX" > /workspace/env.sh
       chmod +x /workspace/env.sh
 
-      echo "Ensuring bucket gs://$$TFSTATE_BUCKET"
-      if ! gcloud storage buckets describe "gs://$$TFSTATE_BUCKET" --format="value(name)" >/dev/null 2>&1; then
-        gcloud storage buckets create "gs://$$TFSTATE_BUCKET" --project="$$PROJECT_ID" --location="$$REGION"
-      else
-        echo "Bucket exists; skipping create."
-      fi
-
-# 1) Terraform init/apply (hashicorp/terraform image has /bin/sh, not bash)
-- id: terraform-init-apply
+# 1) Terraform init/apply (Terraform image only has /bin/sh)
+- id: terraform-apply
   name: hashicorp/terraform:1.9.6
   entrypoint: sh
   dir: infra/terraform
@@ -46,7 +45,7 @@ steps:
 
       terraform apply -auto-approve -input=false
 
-# 2) Get creds and deploy Helm chart (handles pre-created namespace)
+# 2) Get cluster creds + Helm deploy (fixes namespace ownership if it already exists)
 - id: helm-deploy
   name: gcr.io/cloud-builders/gcloud
   entrypoint: bash
@@ -58,7 +57,7 @@ steps:
 
       gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION"
 
-      # If the namespace already exists, mark it as Helm-managed to avoid ownership errors
+      # If namespace is pre-existing, mark it as Helm-managed to avoid ownership error
       if kubectl get ns vikunja >/dev/null 2>&1; then
         kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
         kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja meta.helm.sh/release-namespace=vikunja --overwrite
@@ -66,5 +65,4 @@ steps:
 
       helm repo add vikunja https://vikunja.github.io/vikunja
       helm repo update
-      helm upgrade --install vikunja vikunja/vikunja \
-        --namespace vikunja --create-namespace
+      helm upgrade --install vikunja vikunja/vikunja --namespace vikunja --create-namespace
