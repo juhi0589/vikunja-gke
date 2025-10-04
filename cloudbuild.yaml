@@ -1,58 +1,49 @@
+# cloudbuild.yaml
 options:
-  logging: CLOUD_LOGGING_ONLY
+  logging: CLOUD_LOGGING_ONLY  # compatible even if your trigger sets a service account
 
 steps:
-  # 0) Get kubeconfig for your cluster
-  - name: gcr.io/cloud-builders/gcloud
-    id: get-credentials
-    entrypoint: bash
-    args:
-      - -ceu
-      - |
-        gcloud container clusters get-credentials vikunja-autopilot \
-          --region europe-west4 \
-          --project vikunja-case
+# 0) Get cluster credentials
+- id: get-credentials
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+    - -ceu
+    - |
+      gcloud container clusters get-credentials vikunja-autopilot \
+        --region europe-west4 \
+        --project vikunja-case
 
-  # 1) Make namespace Helm-adoptable (prevents ownership errors)
-  - name: gcr.io/cloud-builders/gcloud
-    id: prepare-namespace
-    entrypoint: bash
-    args:
-      - -ceu
-      - |
-        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
-        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite=true || true
-        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite=true || true
-        kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite=true || true
+# 1) Ensure namespace exists and is Helm-adoptable
+- id: prepare-namespace
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+    - -ceu
+    - |
+      kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
+      kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
+      kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-  # 2) (Optional) Create/refresh the DB password secret expected by the chart
-  #    If your chart doesn't need it, you can remove this step.
-  - name: gcr.io/cloud-builders/gcloud
-    id: create-secrets
-    entrypoint: bash
-    args:
-      - -ceu
-      - |
-        DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project=vikunja-case)"
-        kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=password="${DB_PASS}" \
-          --dry-run=client -o yaml | kubectl apply -f -
+# 2) Create/refresh DB secret from Secret Manager (no custom $VARs used)
+- id: create-secrets
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+    - -ceu
+    - |
+      kubectl -n vikunja create secret generic vikunja-db-secret \
+        --from-literal=postgresql-password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-  # 3) Helm deploy the EXISTING chart at ./helm/vikunja
-  - name: gcr.io/cloud-builders/gcloud
-    id: helm-deploy
-    entrypoint: bash
-    args:
-      - -ceu
-      - |
-        HELM_VERSION="v3.14.4"
-        curl -sSL https://get.helm.sh/helm-$${HELM_VERSION}-linux-amd64.tar.gz | tar -xz
-        mv linux-amd64/helm /usr/local/bin/helm
-        helm version
-
-        # Lint is optional but helpful
-        helm lint ./helm/vikunja || true
-
-        helm upgrade --install vikunja ./helm/vikunja \
-          -n vikunja \
-          --wait --timeout 10m
+# 3) Helm upgrade/install (chart lives at ./helm/vikunja)
+- id: helm-deploy
+  name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+    - -ceu
+    - |
+      helm version
+      helm upgrade --install vikunja ./helm/vikunja \
+        --namespace vikunja --create-namespace \
+        --wait --timeout 10m
