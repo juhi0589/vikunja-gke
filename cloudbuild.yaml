@@ -13,7 +13,7 @@ steps:
           --region europe-west4 \
           --project vikunja-case
 
-  # 1) Ensure namespace exists and is Helm-adoptable
+  # 1) Make namespace Helm-adoptable (prevents ownership errors)
   - name: gcr.io/cloud-builders/gcloud
     id: prepare-namespace
     entrypoint: bash
@@ -25,7 +25,20 @@ steps:
         kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite=true || true
         kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite=true || true
 
-  # 2) Helm deploy the local chart in ./helm
+  # 2) (Optional) Create/refresh the DB password secret expected by the chart
+  #    If your chart doesn't need it, you can remove this step.
+  - name: gcr.io/cloud-builders/gcloud
+    id: create-secrets
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project=vikunja-case)"
+        kubectl -n vikunja create secret generic vikunja-db-secret \
+          --from-literal=password="${DB_PASS}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+  # 3) Helm deploy the EXISTING chart at ./helm/vikunja
   - name: gcr.io/cloud-builders/gcloud
     id: helm-deploy
     entrypoint: bash
@@ -37,7 +50,9 @@ steps:
         mv linux-amd64/helm /usr/local/bin/helm
         helm version
 
-        # Deploy (uses sqlite so the app starts without DB wiring)
-        helm upgrade --install vikunja ./helm \
+        # Lint is optional but helpful
+        helm lint ./helm/vikunja || true
+
+        helm upgrade --install vikunja ./helm/vikunja \
           -n vikunja \
           --wait --timeout 10m
