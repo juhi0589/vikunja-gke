@@ -8,11 +8,11 @@ steps:
 # 1) Terraform apply and capture values we need
 - id: "terraform apply + outputs"
   name: "hashicorp/terraform:1.9.6"
-  entrypoint: /bin/bash
+  entrypoint: /bin/sh
   args:
-    - -ceu
+    - -c
     - |
-      set -euo pipefail
+      set -eu
 
       terraform init -input=false
       terraform apply -input=false -auto-approve
@@ -21,9 +21,9 @@ steps:
       CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
       INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name)"
 
-      # Persist for the next step
+      # Persist for the next step (escape $ so Cloud Build doesn't pre-substitute)
       {
-        echo "PROJECT_ID=${PROJECT_ID}"                  # built-in is allowed
+        echo "PROJECT_ID=${PROJECT_ID}"
         echo "CLUSTER_NAME=$$CLUSTER_NAME"
         echo "INSTANCE_CONN_NAME=$$INSTANCE_CONN_NAME"
       } > /workspace/env.out
@@ -34,12 +34,12 @@ steps:
 # 2) Connect to GKE and deploy with Helm
 - id: "kubectl + helm deploy"
   name: "gcr.io/cloud-builders/gcloud"
-  entrypoint: /bin/bash
+  entrypoint: /bin/sh
   args:
-    - -ceu
+    - -c
     - |
-      set -euo pipefail
-      source /workspace/env.out
+      set -eu
+      . /workspace/env.out
 
       # Discover region for the cluster
       REGION="$(gcloud container clusters list \
@@ -71,7 +71,7 @@ steps:
         --from-literal=VIKUNJA_JWT_SECRET="$$JWT_SECRET" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      # Deploy chart
+      # Deploy chart (assumes your chart is in ./helm/vikunja)
       helm version
       helm upgrade --install vikunja ./helm/vikunja \
         --namespace vikunja \
