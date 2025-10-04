@@ -42,24 +42,22 @@ steps:
         --from-literal=postgresql-password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-# 3) Download Helm directly and deploy (no registry pulls)
+# 3) Download Helm directly and deploy (no registry pulls, no substitutions)
 - id: helm-deploy
   name: gcr.io/cloud-builders/gcloud
   env:
     - KUBECONFIG=/workspace/.kube/config
-    - HELM_VERSION=v3.14.4
   entrypoint: bash
   args:
     - -ceu
     - |
       set -euo pipefail
-      # IMPORTANT: use $$ to escape Cloud Build substitutions; shell sees $HELM_VERSION at runtime
-      curl -fsSL "https://get.helm.sh/helm-$$HELM_VERSION-linux-amd64.tar.gz" -o /workspace/helm.tgz
+      curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
       tar -xzf /workspace/helm.tgz -C /workspace
       mv /workspace/linux-amd64/helm /workspace/helm && chmod +x /workspace/helm
       /workspace/helm version
 
-      # Ensure your chart is committed at ./helm/vikunja (must contain Chart.yaml)
+      # Ensure your chart exists at ./helm/vikunja (must contain Chart.yaml)
       if [ -d "./helm/vikunja" ]; then
         /workspace/helm upgrade --install vikunja ./helm/vikunja \
           --namespace vikunja --create-namespace \
