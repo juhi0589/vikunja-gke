@@ -1,49 +1,47 @@
 replicaCount: 1
 
-image:
-  repository: vikunja/vikunja
-  tag: "latest"
-  pullPolicy: IfNotPresent
+api:
+  image:
+    repository: vikunja/api
+    tag: "latest"
+    pullPolicy: IfNotPresent
 
 service:
   type: ClusterIP
   port: 80
   targetPort: 3456
 
-# Database settings used by the app. We'll still inject the actual password
-# from Secret Manager at deploy time via --set-string db.password=...
 db:
-  host: "34.147.70.155"   # <-- your Cloud SQL public IP
+  host: "34.147.70.155"          # your Cloud SQL public IP
   port: 5432
   name: "vikunja"
   user: "vikunja"
-  password: ""            # leave empty; set by Cloud Build step
+  # Tell the chart which Secret holds the password
+  secretName: "vikunja-db-secret"
+  secretKey: "postgresql-password"
 
-# PVC settings (your chart references storage.size)
 storage:
   enabled: true
   size: 1Gi
-  # storageClassName: ""   # optional; omit to use cluster default
+  # storageClassName: ""         # optional
 
-# Ingress settings (your chart references ingress.enabled)
 ingress:
   enabled: true
-  className: "gce"        # GKE classic Ingress. Use "gce" unless you run another controller.
+  className: "gce"
   annotations: {}
   hosts:
-    - host: "vikunja.example.com"   # <-- put your real DNS name, or leave as placeholder
+    - host: "vikunja.example.com"    # change to your DNS or keep placeholder
       paths:
         - path: /
           pathType: Prefix
-  tls: []                  # add tls config if you have certs
+  tls: []                             # add TLS when ready
 
-# Define cloudsql.* even if you aren't using the proxy
-# (chart template reads cloudsql.image)
+# Define even if you don't use the proxy (chart references cloudsql.image)
 cloudsql:
   enabled: false
   image: "gcr.io/cloud-sql-connectors/cloud-sql-proxy"
   tag: "2.11.3"
-  instanceConnectionName: ""    # only needed if enabled=true
+  instanceConnectionName: ""
   port: 5432
 
 resources: {}
