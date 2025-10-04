@@ -1,84 +1,134 @@
-# cloudbuild.yaml — deploy only, no custom substitutions required
+# cloudbuild.yaml
 timeout: "3600s"
 
 options:
-  # Required when the trigger runs with a Service Account
+  # Required if your trigger sets build.service_account
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # 1) Fetch kubeconfig for the existing cluster and prep the namespace
+  # 0) Prep env & verify the backend bucket exists
   - name: gcr.io/cloud-builders/gcloud
-    id: kubeconfig-and-namespace
-    env: ["HOME=/workspace"]   # share kubeconfig via /workspace (no 'volumes' field)
+    id: prepare-env
     entrypoint: bash
     args:
       - -c
       - |
         set -euo pipefail
 
-        # <<< EDIT THESE TWO IF YOUR CLUSTER NAME / REGION DIFFER >>>
-        CLUSTER_NAME="vikunja-autopilot"
+        # <<< EDIT IF NEEDED >>>
+        TFSTATE_BUCKET="vikunja-case-tfstate"
         REGION="europe-west4"
-        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-        echo "Using cluster: ${CLUSTER_NAME} in region: ${REGION}, project: ${PROJECT_ID}"
-        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
+        PROJECT_ID="$(gcloud config get-value project -q)"
+        echo "Checking bucket: gs://${TFSTATE_BUCKET}"
+        gsutil ls -b "gs://${TFSTATE_BUCKET}" >/dev/null
 
-        # Make namespace Helm-adoptable to avoid the ownership error you saw earlier
-        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create namespace vikunja
-        kubectl label namespace vikunja app.kubernetes.io/managed-by=Helm --overwrite
-        kubectl annotate namespace vikunja meta.helm.sh/release-name=vikunja --overwrite
-        kubectl annotate namespace vikunja meta.helm.sh/release-namespace=vikunja --overwrite
+        cat > /workspace/env.sh <<EOF
+        export TFSTATE_BUCKET="${TFSTATE_BUCKET}"
+        export REGION="${REGION}"
+        export PROJECT_ID="${PROJECT_ID}"
+        EOF
+        chmod +x /workspace/env.sh
+        echo "Wrote /workspace/env.sh"
 
-  # 2) Ensure required secrets (pull DB password from Secret Manager if present)
-  - name: gcr.io/cloud-builders/gcloud
-    id: ensure-secrets
-    env: ["HOME=/workspace"]
-    entrypoint: bash
-    args:
-      - -c
-      - |
-        set -euo pipefail
-
-        # Try to read DB password from Secret Manager
-        set +e
-        DB_PW="$(gcloud secrets versions access latest --secret vikunja-db-password 2>/dev/null)"
-        set -e
-        if [ -n "${DB_PW}" ]; then
-          kubectl -n vikunja create secret generic vikunja-db-secret \
-            --dry-run=client -o yaml \
-            --from-literal=POSTGRES_DB=vikunja \
-            --from-literal=POSTGRES_USER=vikunja \
-            --from-literal=POSTGRES_PASSWORD="${DB_PW}" | kubectl apply -f -
-        else
-          echo "WARNING: Secret Manager secret 'vikunja-db-password' not found; skipping DB secret creation."
-        fi
-
-        # App secret (JWT) — only create if missing
-        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1 ; then
-          APP_SECRET="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
-          kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="${APP_SECRET}"
-        fi
-
-  # 3) Helm deploy from the repo's chart folder
-  - name: alpine/helm:3.14.4
-    id: helm-upgrade
-    env: ["HOME=/workspace"]
+  # 1) Terraform: init/apply with existing GCS backend bucket
+  - name: hashicorp/terraform:1.9.6
+    id: terraform-apply
     entrypoint: sh
     args:
       - -c
       - |
         set -euo pipefail
-        CHART="./helm"   # adjust if your chart is elsewhere (e.g., ./infra/helm)
+        . /workspace/env.sh
 
-        if [ ! -d "$CHART" ]; then
-          echo "Chart directory '$CHART' not found in the repo. Commit your Helm chart under ./helm/ or update CHART path."; exit 1
+        TFDIR="./infra/terraform"
+        echo "Using Terraform directory: $$TFDIR"
+        cd "$$TFDIR"
+
+        terraform init \
+          -input=false \
+          -reconfigure \
+          -backend-config="bucket=$${TFSTATE_BUCKET}"
+
+        terraform apply -auto-approve -input=false
+
+        # Capture outputs if present; fall back to cluster name used in TF
+        terraform output -raw gke_autopilot_name > /workspace/cluster_name 2>/dev/null || echo -n "vikunja-autopilot" > /workspace/cluster_name
+        terraform output -raw instance_connection_name > /workspace/instance_conn 2>/dev/null || true
+
+  # 2) Kubeconfig + namespace + secrets
+  - name: gcr.io/cloud-builders/gcloud
+    id: kube-setup
+    env:
+      - HOME=/workspace  # writes ~/.kube under /workspace so next step can use it
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        . /workspace/env.sh
+
+        CLUSTER_NAME="$(cat /workspace/cluster_name || echo vikunja-autopilot)"
+        echo "Using cluster: $$CLUSTER_NAME in $$REGION, project: $$PROJECT_ID"
+
+        gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION" --project "$$PROJECT_ID"
+
+        # Make namespace Helm-adoptable to avoid the ownership error you saw
+        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create namespace vikunja
+        kubectl label namespace vikunja app.kubernetes.io/managed-by=Helm --overwrite
+        kubectl annotate namespace vikunja meta.helm.sh/release-name=vikunja --overwrite
+        kubectl annotate namespace vikunja meta.helm.sh/release-namespace=vikunja --overwrite
+
+        # DB secret from GSM if exists, else generate
+        set +e
+        DB_PW="$(gcloud secrets versions access latest --secret vikunja-db-password 2>/dev/null)"
+        set -e
+        if [ -z "$$DB_PW" ]; then
+          DB_PW="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
         fi
 
+        kubectl -n vikunja create secret generic vikunja-db-secret \
+          --dry-run=client -o yaml \
+          --from-literal=POSTGRES_DB=vikunja \
+          --from-literal=POSTGRES_USER=vikunja \
+          --from-literal=POSTGRES_PASSWORD="$$DB_PW" \
+        | kubectl apply -f -
+
+        # App secret (JWT) if missing
+        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1 ; then
+          APP_SECRET="$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)"
+          kubectl -n vikunja create secret generic vikunja-app-secret \
+            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$$APP_SECRET"
+        fi
+
+  # 3) Helm deploy (use a reliable public Helm image)
+  - name: alpine/helm:3.14.4
+    id: helm-deploy
+    env:
+      - HOME=/workspace
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -euo pipefail
+
+        # Prefer your repo chart if present
+        if [ -d "./infra/helm" ]; then
+          CHART="./infra/helm"
+        elif [ -d "./helm" ]; then
+          CHART="./helm"
+        else
+          CHART="oci://ghcr.io/vikunja/helm/vikunja"
+        fi
+
+        echo "Deploying chart: $$CHART"
         helm version
-        helm upgrade --install vikunja "$CHART" \
+
+        # Add "-f infra/helm/values.yaml" here if you have one
+        helm upgrade vikunja "$$CHART" \
           --namespace vikunja \
           --create-namespace \
+          --install \
           --wait \
           --timeout 15m
