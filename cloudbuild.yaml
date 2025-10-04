@@ -1,101 +1,80 @@
-# Cloud Build: Terraform (GKE Autopilot + Cloud SQL) -> K8s secrets -> Helm (Vikunja) Running
-# Project: vikunja-case | Region: europe-west4
-timeout: "3600s"
-options:
-  logging: CLOUD_LOGGING_ONLY
-
 steps:
-  # 1) Terraform init/apply (GCS backend), then write outputs to /workspace/env.out
-  - id: "terraform apply + outputs"
-    name: "hashicorp/terraform:1.9.6"
-    entrypoint: "sh"
-    args:
-      - -c
-      - |
-        set -eu
-        REGION="europe-west4"
-        TFSTATE_BUCKET="vikunja-case-tfstate"
-        PROJECT_ID="${PROJECT_ID:-vikunja-case}"
+# -------------------------------
+# 0) Terraform: create/update infra & write outputs we need for deploy
+# -------------------------------
+- name: hashicorp/terraform:1.9.6
+  id: terraform apply + outputs
+  entrypoint: /bin/sh
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      terraform init -input=false
+      terraform apply -auto-approve -input=false
 
-        cd infra/terraform
+      # Export a small env file for the next step
+      cat > /workspace/env.out <<'EOF'
+      PROJECT_ID=${PROJECT_ID}
+      REGION=europe-west4
+      CLUSTER_NAME=vikunja-autopilot
+      INSTANCE_CONN_NAME=$(terraform output -raw instance_connection_name || true)
+      EOF
+      echo "Wrote /workspace/env.out:"
+      cat /workspace/env.out
 
-        terraform init -input=false \
-          -backend-config="bucket=$$TFSTATE_BUCKET" \
-          -backend-config="prefix=vikunja/state"
+# -------------------------------
+# 1) Kubectl + Helm: adopt namespace, create secrets idempotently, install chart
+# -------------------------------
+- name: gcr.io/cloud-builders/gcloud
+  id: kubectl + helm deploy
+  entrypoint: /bin/bash
+  args:
+    - -euxo
+    - pipefail
+    - -c
+    - |
+      # Load values exported by step #0
+      source /workspace/env.out
 
-        terraform apply -input=false -auto-approve \
-          -var="project_id=$$PROJECT_ID" \
-          -var="region=$$REGION"
+      echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}"
+      gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
 
-        # Read outputs (cluster required; SQL optional)
-        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
-        INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name 2>/dev/null || true)"
+      # Create namespace if missing
+      kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
 
-        {
-          echo "PROJECT_ID=$$PROJECT_ID"
-          echo "REGION=$$REGION"
-          echo "CLUSTER_NAME=$$CLUSTER_NAME"
-          if [ -n "$$INSTANCE_CONN_NAME" ]; then
-            echo "INSTANCE_CONN_NAME=$$INSTANCE_CONN_NAME"
-          fi
-        } > /workspace/env.out
+      # Make the namespace Helm-managed (this fixes the error you saw)
+      kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
+      kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
+      kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-        echo "Wrote /workspace/env.out:"
-        cat /workspace/env.out
+      # Create/update secrets idempotently
+      DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
+      kubectl -n vikunja create secret generic vikunja-db-secret \
+        --from-literal=POSTGRES_PASSWORD="${DB_PASS}" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-  # 2) Get GKE creds, create secrets, install Helm chart
-  - id: "kubectl + helm deploy"
-    name: "gcr.io/cloud-builders/gcloud"
-    entrypoint: "bash"
-    args:
-      - -ceu
-      - |
-        set -euo pipefail
-        source /workspace/env.out
-        echo "Using cluster: $$CLUSTER_NAME in $$REGION, project $$PROJECT_ID"
+      # (Optional dummy app secret to keep parity with your earlier logs)
+      kubectl -n vikunja create secret generic vikunja-app-secret \
+        --from-literal=DUMMY="ok" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
-        # Kubeconfig
-        gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION" --project "$$PROJECT_ID"
+      # Helm install/upgrade
+      helm repo add vikunja https://vikunja.github.io/helm-charts || true
+      helm repo update
+      helm upgrade --install vikunja vikunja/vikunja \
+        --namespace vikunja \
+        --wait --timeout 20m
 
-        # Namespace
-        kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
+      # Show what came up
+      kubectl -n vikunja get pods
+      kubectl -n vikunja get svc
 
-        # DB password from Secret Manager -> K8s Secret
-        DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "$$PROJECT_ID")"
-        kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=POSTGRES_PASSWORD="$$DB_PASS" \
-          --from-literal=POSTGRES_USER="vikunja" \
-          --from-literal=POSTGRES_DB="vikunja" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
-        # App JWT (create once)
-        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
-          JWT="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-          kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$$JWT"
-        fi
-
-        # Install Helm (in the gcloud builder)
-        curl -sSL "https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz" -o /tmp/helm.tgz
-        tar -xzf /tmp/helm.tgz -C /tmp
-        mv /tmp/linux-amd64/helm /usr/local/bin/helm
-        helm version
-
-        # Helm upgrade (inject Cloud SQL instance if present)
-        HELM_ARGS="-n vikunja --create-namespace"
-        if [ -n "$$INSTANCE_CONN_NAME" ]; then
-          HELM_ARGS="$$HELM_ARGS --set cloudsql.instanceConnectionName=$$INSTANCE_CONN_NAME"
-        fi
-
-        helm upgrade --install vikunja ./helm/vikunja $$HELM_ARGS
-
-        # (Optional) Print external IP when ready
-        echo "Waiting for vikunja service external IP..."
-        for i in {1..30}; do
-          EXTERNAL_IP="$(kubectl -n vikunja get svc -l app.kubernetes.io/name=vikunja -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-          if [ -n "$$EXTERNAL_IP" ]; then
-            echo "Vikunja is likely reachable at: http://$$EXTERNAL_IP/"
-            break
-          fi
-          sleep 10
-        done
+# (Optional) print some context after build
+- name: gcr.io/cloud-builders/gcloud
+  id: show cluster & namespace
+  entrypoint: /bin/bash
+  args:
+    - -c
+    - |
+      source /workspace/env.out
+      gcloud container cluster
