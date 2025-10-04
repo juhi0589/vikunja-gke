@@ -9,21 +9,21 @@ steps:
         CLUSTER_NAME="vikunja-autopilot"
         REGION="europe-west4"
 
-        # Get kubeconfig
+        # Get kubeconfig for the cluster
         gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION"
 
-        # Persist kubeconfig for later steps
+        # Persist kubeconfig so the next step can use it
         export KUBECONFIG=/workspace/kubeconfig
-        mkdir -p "$(dirname "$KUBECONFIG")"
         kubectl config view --raw > "$KUBECONFIG"
 
-        # Ensure namespace exists and is Helm-adoptable (prevents the 'invalid ownership metadata' error)
+        # Ensure namespace exists and is Helm-adoptable
         kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
         kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
         kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
         kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-  - name: gcr.io/cloud-builders/helm:3.14.4
+  # Pin a working Helm image (avoid ':latest' not found)
+  - name: alpine/helm:3.14.4
     id: helm upgrade/install
     env:
       - KUBECONFIG=/workspace/kubeconfig
@@ -37,5 +37,5 @@ steps:
       - --create-namespace
 
 options:
-  # If your trigger sets a service account, this avoids the logs_bucket requirement.
+  # If your trigger specifies a service account, this avoids requiring a logs bucket.
   logging: CLOUD_LOGGING_ONLY
