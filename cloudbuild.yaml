@@ -1,8 +1,13 @@
 # cloudbuild.yaml
 timeout: "3600s"
 
+options:
+  # Required when the build runs with a Service Account
+  # (satisfies the "'build.service_account' must configure logging" error)
+  logging: CLOUD_LOGGING_ONLY
+
 steps:
-  # 0) Prepare runtime env (no Cloud Build substitutions used)
+  # 0) Prepare runtime env (NO Cloud Build custom substitutions)
   - name: gcr.io/cloud-builders/gcloud
     id: prepare-env
     entrypoint: bash
@@ -11,10 +16,10 @@ steps:
       - |
         set -euo pipefail
 
-        # >>> EDIT THESE TWO IF YOU NEED DIFFERENT VALUES <<<
+        # >>> EDIT THESE IF NEEDED <<<
         TFSTATE_BUCKET="vikunja-case-tfstate"
         REGION="europe-west4"
-        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
         echo "Checking bucket: gs://${TFSTATE_BUCKET}"
         gsutil ls -b gs://${TFSTATE_BUCKET} >/dev/null
@@ -24,11 +29,10 @@ steps:
         export TFSTATE_BUCKET="vikunja-case-tfstate"
         export REGION="europe-west4"
         EOF
-
         chmod +x /workspace/env.sh
         echo "Wrote /workspace/env.sh"
 
-  # 1) Terraform init/apply using the existing backend & bucket
+  # 1) Terraform init/apply using existing backend bucket
   - name: hashicorp/terraform:1.9.6
     id: terraform-apply
     entrypoint: sh
@@ -38,10 +42,9 @@ steps:
         set -euo pipefail
         . /workspace/env.sh
 
-        # If your Terraform is elsewhere, adjust this path:
+        # Adjust if your Terraform lives elsewhere
         TFDIR="./infra/terraform"
         echo "Using Terraform directory: ${TFDIR}"
-
         cd "${TFDIR}"
 
         terraform init \
@@ -51,16 +54,15 @@ steps:
 
         terraform apply -auto-approve -input=false
 
-        # Capture outputs for later steps (if defined)
+        # Capture outputs for later steps (fallbacks if not defined)
         terraform output -raw gke_autopilot_name > /workspace/cluster_name 2>/dev/null || echo -n "vikunja-autopilot" > /workspace/cluster_name
         terraform output -raw instance_connection_name > /workspace/instance_conn 2>/dev/null || true
 
-  # 2) Get kubeconfig and prep namespace + secrets
+  # 2) Get kubeconfig; prep namespace + secrets
   - name: gcr.io/cloud-builders/gcloud
     id: kube-setup
-    # Write kubeconfig into /workspace so it persists to next step
     env:
-      - HOME=/workspace
+      - HOME=/workspace   # share kubeconfig between steps without 'volumes'
     entrypoint: bash
     args:
       - -c
@@ -73,13 +75,13 @@ steps:
 
         gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
 
-        # Create/label namespace so Helm can adopt it (prevents the ownership error)
+        # Make namespace Helm-adoptable (prevents ownership error)
         kubectl get ns vikunja >/dev/null 2>&1 || kubectl create namespace vikunja
         kubectl label namespace vikunja app.kubernetes.io/managed-by=Helm --overwrite
         kubectl annotate namespace vikunja meta.helm.sh/release-name=vikunja --overwrite
         kubectl annotate namespace vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-        # Create K8s secrets (DB password from Secret Manager, if available)
+        # DB secret from Secret Manager if available, otherwise generate one
         set +e
         DB_PW="$(gcloud secrets versions access latest --secret vikunja-db-password 2>/dev/null)"
         set -e
@@ -102,7 +104,7 @@ steps:
             --from-literal=VIKUNJA_SERVICE_JWTSECRET="${APP_SECRET}"
         fi
 
-  # 3) Helm deploy (use a reliable image & shared kubeconfig via HOME=/workspace)
+  # 3) Helm deploy (reliable image; uses shared kubeconfig via HOME=/workspace)
   - name: alpine/helm:3.14.4
     id: helm-deploy
     env:
@@ -113,8 +115,7 @@ steps:
       - |
         set -euo pipefail
 
-        # Decide chart source:
-        # Prefer local chart if present, else fall back to official OCI chart.
+        # Prefer local chart if present; else use official OCI chart
         if [ -d "./infra/helm" ]; then
           CHART="./infra/helm"
         elif [ -d "./helm" ]; then
@@ -123,16 +124,10 @@ steps:
           CHART="oci://ghcr.io/vikunja/helm/vikunja"
         fi
 
-        # If using OCI chart, ensure repo login not needed (public)
         echo "Deploying chart: ${CHART}"
         helm version
 
-        # Common flags
         HELM_FLAGS="--namespace vikunja --create-namespace --install --wait --timeout 15m"
 
-        # Example values overrides (add/adjust as needed)
-        # helm upgrade vikunja "$CHART" $HELM_FLAGS -f infra/helm/values.yaml
+        # If you have a values file, add: -f infra/helm/values.yaml
         helm upgrade vikunja "$CHART" $HELM_FLAGS
-
-# No non-built-in substitutions used in this file
-# (We only rely on built-in $PROJECT_ID which Cloud Build always provides)
