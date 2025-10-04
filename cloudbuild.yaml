@@ -1,4 +1,4 @@
-# Cloud Build: Terraform (GKE Autopilot + Cloud SQL) -> K8s secrets -> Helm (Vikunja)
+# Cloud Build: Terraform (GKE Autopilot + Cloud SQL) -> K8s secrets -> Helm (Vikunja) Running
 # Project: vikunja-case | Region: europe-west4
 timeout: "3600s"
 options:
