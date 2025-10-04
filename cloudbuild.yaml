@@ -1,36 +1,45 @@
-# cloudbuild.yaml
-
+# cloudbuild.yaml (no custom substitutions needed)
 options:
-  # Satisfies the logging requirement even when a user-managed SA is used
   logging: CLOUD_LOGGING_ONLY
   default_logs_bucket_behavior: REGIONAL_USER_OWNED_BUCKET
 
 timeout: "3600s"
 
 steps:
-# ---- 1) Terraform apply & capture outputs for later steps ----
+# 1) Terraform apply and capture values we need
 - id: "terraform apply + outputs"
   name: "hashicorp/terraform:1.9.6"
-  entrypoint: /bin/sh
+  entrypoint: /bin/bash
   args:
-    - -c
+    - -ceu
     - |
-      set -eux
+      set -euo pipefail
       terraform init -input=false
       terraform apply -input=false -auto-approve
 
-      # Persist values we need in later steps
+      # Read outputs
+      CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
+      INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name)"
+      PROJECT_ID="$PROJECT_ID"   # built-in is OK to use
+
+      # Discover the region from the cluster
+      REGION="$(gcloud container clusters list \
+        --project="${PROJECT_ID}" \
+        --filter="name=$$CLUSTER_NAME" \
+        --format="value(location)")"
+
+      # Persist for next step (escape non-builtins with $$ so CB doesn't substitute)
       {
-        echo "PROJECT_ID=$(terraform output -raw project_id)"
-        echo "REGION=$(terraform output -raw region)"
-        echo "CLUSTER_NAME=$(terraform output -raw gke_autopilot_name)"
-        echo "INSTANCE_CONN_NAME=$(terraform output -raw instance_connection_name)"
+        echo "PROJECT_ID=${PROJECT_ID}"
+        echo "REGION=$$REGION"
+        echo "CLUSTER_NAME=$$CLUSTER_NAME"
+        echo "INSTANCE_CONN_NAME=$$INSTANCE_CONN_NAME"
       } > /workspace/env.out
 
       echo "---- env.out ----"
       cat /workspace/env.out
 
-# ---- 2) Connect to GKE and deploy with Helm ----
+# 2) Connect to GKE and deploy with Helm
 - id: "kubectl + helm deploy"
   name: "gcr.io/cloud-builders/gcloud"
   entrypoint: /bin/bash
@@ -40,20 +49,24 @@ steps:
       set -euo pipefail
       source /workspace/env.out
 
-      echo "Using cluster: $CLUSTER_NAME in region $REGION (project $PROJECT_ID)"
+      echo "Using cluster $CLUSTER_NAME in $REGION (project $PROJECT_ID)"
       gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
 
-      # If helm isn't present in this builder, uncomment the lines below to install it:
-      # HELM_VER="v3.14.4"
-      # curl -sSL "https://get.helm.sh/helm-${HELM_VER}-linux-amd64.tar.gz" | tar -xz
-      # mv linux-amd64/helm /usr/local/bin/helm
+      # Ensure namespace has Helm ownership labels/annotations (prevents ownership error)
+      cat <<'EOF' | kubectl apply -f -
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: vikunja
+        labels:
+          app.kubernetes.io/managed-by: Helm
+        annotations:
+          meta.helm.sh/release-name: vikunja
+          meta.helm.sh/release-namespace: vikunja
+      EOF
 
-      helm version
-
-      # Secrets (idempotent)
+      # Secrets
       DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password --project "$PROJECT_ID")"
-
-      kubectl create namespace vikunja --dry-run=client -o yaml | kubectl apply -f -
 
       kubectl -n vikunja create secret generic vikunja-db-secret \
         --from-literal=VIKUNJA_DB_HOST="$INSTANCE_CONN_NAME" \
@@ -67,10 +80,10 @@ steps:
         --from-literal=VIKUNJA_JWT_SECRET="$JWT_SECRET" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      # Path to your chart in the repo:
+      # Chart path in repo
       CHART_PATH="./helm/vikunja"
 
-      # Install/upgrade and let Helm own the namespace (prevents ownership label errors)
+      helm version
       helm upgrade --install vikunja "$CHART_PATH" \
         --namespace vikunja \
         --create-namespace \
