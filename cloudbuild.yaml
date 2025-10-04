@@ -16,7 +16,7 @@ steps:
       mkdir -p /workspace/.kube
       cp -f /builder/home/.kube/config /workspace/.kube/config
 
-# 1) Prepare namespace and make it Helm-adoptable (avoids the ownership error)
+# 1) Prepare namespace and make it Helm-adoptable (avoids ownership error)
 - id: prepare-namespace
   name: gcr.io/cloud-builders/gcloud
   env:
@@ -42,27 +42,37 @@ steps:
         --from-literal=postgresql-password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-# 3) Download Helm directly and deploy (no registry pulls, no substitutions)
+# 3) Download Helm and deploy
 - id: helm-deploy
   name: gcr.io/cloud-builders/gcloud
   env:
     - KUBECONFIG=/workspace/.kube/config
+    - HELM_VERSION=v3.14.4
+    # Adjust if your chart lives elsewhere. Must contain Chart.yaml.
+    - CHART_DIR=./helm/vikunja
   entrypoint: bash
   args:
     - -ceu
     - |
       set -euo pipefail
-      curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
+
+      # Clean previous artifacts so /workspace/helm is a FILE, not a DIR
+      rm -rf /workspace/helm /workspace/linux-amd64 /workspace/helm.tgz
+
+      # Fetch & unpack helm
+      curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /workspace/helm.tgz
       tar -xzf /workspace/helm.tgz -C /workspace
-      mv /workspace/linux-amd64/helm /workspace/helm && chmod +x /workspace/helm
+      mv /workspace/linux-amd64/helm /workspace/helm
+      chmod +x /workspace/helm
       /workspace/helm version
 
-      # Ensure your chart exists at ./helm/vikunja (must contain Chart.yaml)
-      if [ -d "./helm/vikunja" ]; then
-        /workspace/helm upgrade --install vikunja ./helm/vikunja \
-          --namespace vikunja --create-namespace \
-          --wait --timeout 15m
-      else
-        echo "ERROR: Chart not found at ./helm/vikunja"
+      # Check chart presence
+      if [ ! -f "${CHART_DIR}/Chart.yaml" ]; then
+        echo "ERROR: Chart.yaml not found in ${CHART_DIR}"
         exit 1
       fi
+
+      # Deploy/upgrade
+      /workspace/helm upgrade --install vikunja "${CHART_DIR}" \
+        --namespace vikunja --create-namespace \
+        --wait --timeout 15m
