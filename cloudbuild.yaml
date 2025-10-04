@@ -3,7 +3,6 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # 1) Prepare env and verify the tfstate bucket exists (no creation here)
   - id: prepare-env
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
@@ -15,23 +14,22 @@ steps:
         PROJECT_ID="$(gcloud config get-value project)"
         REGION="europe-west4"
         CLUSTER_NAME="vikunja-autopilot"
-        TFSTATE_BUCKET="${PROJECT_ID}-tfstate"
+        TFSTATE_BUCKET="$${PROJECT_ID}-tfstate"
         TFSTATE_PREFIX="gke"
 
-        echo "Checking bucket: gs://${TFSTATE_BUCKET}"
-        gsutil ls -b "gs://${TFSTATE_BUCKET}" >/dev/null
+        echo "Checking bucket: gs://$${TFSTATE_BUCKET}"
+        gsutil ls -b "gs://$${TFSTATE_BUCKET}" >/dev/null
 
         {
-          echo "export PROJECT_ID=${PROJECT_ID}"
-          echo "export REGION=${REGION}"
-          echo "export CLUSTER_NAME=${CLUSTER_NAME}"
-          echo "export TFSTATE_BUCKET=${TFSTATE_BUCKET}"
-          echo "export TFSTATE_PREFIX=${TFSTATE_PREFIX}"
+          echo "export PROJECT_ID=$${PROJECT_ID}"
+          echo "export REGION=$${REGION}"
+          echo "export CLUSTER_NAME=$${CLUSTER_NAME}"
+          echo "export TFSTATE_BUCKET=$${TFSTATE_BUCKET}"
+          echo "export TFSTATE_PREFIX=$${TFSTATE_PREFIX}"
         } > /workspace/env.sh
         chmod +x /workspace/env.sh
         echo "Wrote /workspace/env.sh"
 
-  # 2) Terraform init/apply using existing bucket backend
   - id: terraform-apply
     name: hashicorp/terraform:1.9.6
     entrypoint: sh
@@ -45,14 +43,13 @@ steps:
 
         terraform -chdir=infra/terraform init \
           -input=false \
-          -backend-config="bucket=${TFSTATE_BUCKET}" \
-          -backend-config="prefix=${TFSTATE_PREFIX}"
+          -backend-config="bucket=$${TFSTATE_BUCKET}" \
+          -backend-config="prefix=$${TFSTATE_PREFIX}"
 
         terraform -chdir=infra/terraform apply -auto-approve -input=false \
-          -var="project_id=${PROJECT_ID}" \
-          -var="region=${REGION}"
+          -var="project_id=$${PROJECT_ID}" \
+          -var="region=$${REGION}"
 
-  # 3) Get kube creds, prep namespace for Helm adoption, create secrets
   - id: k8s-preflight
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
@@ -63,10 +60,9 @@ steps:
         . /workspace/env.sh
 
         export KUBECONFIG=/workspace/kubeconfig
-        mkdir -p "$(dirname "${KUBECONFIG}")"
 
         echo "Getting cluster credentials..."
-        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}"
+        gcloud container clusters get-credentials "$${CLUSTER_NAME}" --region "$${REGION}"
 
         echo "Ensure namespace exists and is Helm-adoptable..."
         kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
@@ -79,14 +75,13 @@ steps:
         APP_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
         kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=POSTGRES_PASSWORD="${DB_PASSWORD}" \
+          --from-literal=POSTGRES_PASSWORD="$$DB_PASSWORD" \
           --dry-run=client -o yaml | kubectl apply -f -
 
         kubectl -n vikunja create secret generic vikunja-app-secret \
-          --from-literal=JWT_SECRET="${APP_SECRET}" \
+          --from-literal=JWT_SECRET="$$APP_SECRET" \
           --dry-run=client -o yaml | kubectl apply -f -
 
-  # 4) Helm install/upgrade (separate Helm builder; reuses kubeconfig from workspace)
   - id: helm-deploy
     name: gcr.io/cloud-builders/helm
     env:
