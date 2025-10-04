@@ -1,68 +1,100 @@
-timeout: "3600s"
+timeout: "1200s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-# 0) Prepare environment + verify the tfstate bucket exists (no creation here)
-- id: prepare-env
-  name: gcr.io/cloud-builders/gcloud
-  entrypoint: bash
-  args:
-    - -c
-    - |
-      set -euo pipefail
-      PROJECT_ID="$$(gcloud config get-value project)"
-      REGION="europe-west4"
-      CLUSTER_NAME="vikunja-autopilot"
-      TFSTATE_BUCKET="$$PROJECT_ID-tfstate"
-      TFSTATE_PREFIX="gke"
+  # Prep: set env and verify the tfstate bucket exists (no creation)
+  - id: prepare-env
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
 
-      echo "Checking bucket: gs://$$TFSTATE_BUCKET"
-      if ! gcloud storage buckets describe "gs://$$TFSTATE_BUCKET" >/dev/null 2>&1; then
-        echo "ERROR: Bucket gs://$$TFSTATE_BUCKET not found. Create it once and re-run." >&2
-        exit 1
-      fi
+        PROJECT_ID="$(gcloud config get-value project)"
+        REGION="europe-west4"
+        CLUSTER_NAME="vikunja-autopilot"
+        TFSTATE_BUCKET="${PROJECT_ID}-tfstate"
+        TFSTATE_PREFIX="gke"
 
-      # write env for later steps (Cloud Build rewrites $$ → $ at runtime)
-      printf 'export PROJECT_ID=%s\nexport REGION=%s\nexport CLUSTER_NAME=%s\nexport TFSTATE_BUCKET=%s\nexport TFSTATE_PREFIX=%s\n' \
-        "$$PROJECT_ID" "$$REGION" "$$CLUSTER_NAME" "$$TFSTATE_BUCKET" "$$TFSTATE_PREFIX" > /workspace/env.sh
-      chmod +x /workspace/env.sh
+        echo "Checking bucket: gs://${TFSTATE_BUCKET}"
+        gcloud storage buckets describe "gs://${TFSTATE_BUCKET}" >/dev/null
 
-# 1) Terraform init/apply (Terraform image only has /bin/sh)
-- id: terraform-apply
-  name: hashicorp/terraform:1.9.6
-  entrypoint: sh
-  dir: infra/terraform
-  args:
-    - -c
-    - |
-      set -e
-      . /workspace/env.sh
+        cat > /workspace/env.sh <<EOF
+export PROJECT_ID=${PROJECT_ID}
+export REGION=${REGION}
+export CLUSTER_NAME=${CLUSTER_NAME}
+export TFSTATE_BUCKET=${TFSTATE_BUCKET}
+export TFSTATE_PREFIX=${TFSTATE_PREFIX}
+EOF
+        chmod +x /workspace/env.sh
+        echo "Wrote /workspace/env.sh"
 
-      terraform init -input=false \
-        -backend-config="bucket=$$TFSTATE_BUCKET" \
-        -backend-config="prefix=$$TFSTATE_PREFIX"
+  # Terraform: init + apply using the existing bucket
+  - id: terraform apply
+    name: hashicorp/terraform:1.9.6
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        . /workspace/env.sh
 
-      terraform apply -auto-approve -input=false
+        terraform -chdir=infra/terraform init \
+          -input=false \
+          -backend-config="bucket=${TFSTATE_BUCKET}" \
+          -backend-config="prefix=${TFSTATE_PREFIX}"
 
-# 2) Get cluster creds + Helm deploy (fixes namespace ownership if it already exists)
-- id: helm-deploy
-  name: gcr.io/cloud-builders/gcloud
-  entrypoint: bash
-  args:
-    - -c
-    - |
-      set -euo pipefail
-      . /workspace/env.sh
+        terraform -chdir=infra/terraform apply -auto-approve -input=false \
+          -var="project_id=${PROJECT_ID}" \
+          -var="region=${REGION}"
 
-      gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION"
+  # Deploy: get kube creds, prep namespace for Helm adoption, create secrets, helm upgrade
+  - id: kubectl + helm deploy
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        . /workspace/env.sh
 
-      # If namespace is pre-existing, mark it as Helm-managed to avoid ownership error
-      if kubectl get ns vikunja >/dev/null 2>&1; then
-        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
-        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja meta.helm.sh/release-namespace=vikunja --overwrite
-      fi
+        echo "Getting cluster credentials..."
+        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}"
 
-      helm repo add vikunja https://vikunja.github.io/vikunja
-      helm repo update
-      helm upgrade --install vikunja vikunja/vikunja --namespace vikunja --create-namespace
+        echo "Ensuring namespace with Helm adoption labels/annotations..."
+        kubectl apply -f - <<'NS'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vikunja
+  labels:
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    meta.helm.sh/release-name: vikunja
+    meta.helm.sh/release-namespace: vikunja
+NS
+
+        echo "Creating/updating secrets..."
+        # Requires Secret Manager access on this SA for 'vikunja-db-password'
+        DB_PASSWORD="$(gcloud secrets versions access latest --secret='vikunja-db-password')"
+        # Simple random app secret
+        APP_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+        kubectl -n vikunja create secret generic vikunja-db-secret \
+          --from-literal=POSTGRES_PASSWORD="${DB_PASSWORD}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        kubectl -n vikunja create secret generic vikunja-app-secret \
+          --from-literal=JWT_SECRET="${APP_SECRET}" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        echo "Helm version:"
+        helm version
+
+        echo "Installing/upgrading Helm release..."
+        # Assumes the chart lives at ./helm/vikunja in your repo
+        helm upgrade --install vikunja ./helm/vikunja \
+          --namespace vikunja \
+          --wait --timeout 10m
