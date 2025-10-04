@@ -1,3 +1,4 @@
+# --- image & replicas ---
 image:
   repository: vikunja/vikunja
   tag: latest
@@ -5,30 +6,36 @@ image:
 
 replicaCount: 1
 
+# --- service ---
 service:
   type: ClusterIP
   port: 80
   targetPort: 3456
 
-# Add this block so templates/ingress.yaml can read .Values.ingress.enabled
-ingress:
-  enabled: false        # set true if you actually want an Ingress
-  className: ""         # e.g. "gce" or "nginx" if you enable it
-  annotations: {}       # add controller-specific annotations if needed
-  hosts: []             # e.g. [{ host: "vikunja.example.com", paths: [{ path: "/", pathType: "Prefix" }] }]
-  tls: []               # e.g. [{ hosts: ["vikunja.example.com"], secretName: "vikunja-tls" }]
+# --- database (required by templates) ---
+db:
+  host: "34.147.70.155"   # <-- your Cloud SQL public IP
+  port: 5432
+  name: "vikunja"
+  user: "vikunja"
+  # DO NOT hardcode the password here; it will be injected from Secret Manager via --set at deploy time.
+  # password: ""
 
-# Add this block so templates/pvc.yaml can read .Values.storage.size
+# --- storage (required by pvc.yaml) ---
 storage:
   enabled: true
-  name: vikunja-data
   size: 10Gi
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: ""  # empty = cluster default; or set "standard-rwo" etc.
+  # On GKE Autopilot the default SC is usually "standard-rwo" (check with: kubectl get sc)
+  storageClassName: "standard-rwo"
 
-resources: {}
-
-nodeSelector: {}
-tolerations: []
-affinity: {}
+# --- ingress (enable it) ---
+ingress:
+  enabled: true
+  className: "gce"     # GKE's GLBC ingress class
+  annotations: {}
+  hosts:
+    - host: "vikunja.example.com"    # <-- put your real domain here
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []  # add a managed cert later if you have one
