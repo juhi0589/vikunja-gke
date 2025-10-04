@@ -10,8 +10,27 @@ service:
   port: 80
   targetPort: 3456
 
-resources: {}
+# Autopilot behaves best when requests/limits are set explicitly.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
 
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# >>> Added block — required by templates/pvc.yaml <<<
+storage:
+  enabled: true            # set false if you don't want a PVC
+  name: vikunja-data       # PVC name
+  size: 10Gi               # <-- what pvc.yaml reads
+  accessModes:
+    - ReadWriteOnce
+  # In GKE Autopilot the default class is usually "standard-rwo".
+  # Leave empty to use the cluster default, or set explicitly:
+  # storageClassName: standard-rwo
+  storageClassName: ""
