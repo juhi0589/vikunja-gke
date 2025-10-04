@@ -1,73 +1,75 @@
+# cloudbuild.yaml
+timeout: "3600s"
+
+options:
+  # Avoids the logs-bucket requirement when a custom SA is used on the trigger
+  logging: CLOUD_LOGGING_ONLY
+
 steps:
-# 0) Terraform: create/update infra & write outputs we need for deploy
-- name: hashicorp/terraform:1.9.6
-  id: terraform apply + outputs
-  entrypoint: /bin/sh
-  args:
-    - -c
-    - |
-      set -euo pipefail
-      terraform init -input=false
-      terraform apply -auto-approve -input=false
+  # 0) Terraform: create/keep infra and write outputs for the deploy step
+  - name: hashicorp/terraform:1.9.6
+    id: terraform apply + outputs
+    entrypoint: /bin/sh
+    args:
+      - -c
+      - |
+        set -euo pipefail
 
-      # Pull values from Terraform outputs and write an env file
-      PROJECT_ID="${PROJECT_ID}"                       # built-in
-      REGION="europe-west4"                            # set here (or make TF output if you want)
-      CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
-      INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name)"
+        terraform init -input=false
+        terraform apply -auto-approve -input=false
 
-      cat > /workspace/env.out <<EOF
+        PROJECT_ID="${PROJECT_ID}"        # built-in from Cloud Build
+        REGION="europe-west4"             # set here (no custom substitutions)
+        CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
+        INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name)"
+
+        cat > /workspace/env.out <<EOF
 PROJECT_ID=${PROJECT_ID}
 REGION=${REGION}
 CLUSTER_NAME=${CLUSTER_NAME}
 INSTANCE_CONN_NAME=${INSTANCE_CONN_NAME}
 EOF
-      echo "Wrote /workspace/env.out:"
-      cat /workspace/env.out
 
-# 1) Kubectl + Helm: adopt namespace, create secrets idempotently, install chart
-- name: gcr.io/cloud-builders/gcloud
-  id: kubectl + helm deploy
-  entrypoint: /bin/bash
-  args:
-    - -c
-    - |
-      set -euo pipefail
-      source /workspace/env.out
+        echo "Wrote /workspace/env.out:"
+        cat /workspace/env.out
 
-      echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}"
-      gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
+  # 1) Get kubeconfig, fix namespace ownership labels, apply secrets, helm install/upgrade
+  - name: gcr.io/cloud-builders/gcloud
+    id: kubectl + helm deploy
+    entrypoint: /bin/bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        source /workspace/env.out
 
-      # Create namespace if missing
-      kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
+        echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}"
+        gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}"
 
-      # Make the namespace Helm-managed (fixes the 'invalid ownership metadata' error)
-      kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
-      kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
-      kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
+        # Create namespace if missing
+        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
 
-      # Secrets (idempotent)
-      DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
-      kubectl -n vikunja create secret generic vikunja-db-secret \
-        --from-literal=POSTGRES_PASSWORD="${DB_PASS}" \
-        --dry-run=client -o yaml | kubectl apply -f -
+        # Make namespace Helm-managed (prevents 'invalid ownership metadata' error)
+        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
+        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
+        kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-      kubectl -n vikunja create secret generic vikunja-app-secret \
-        --from-literal=DUMMY="ok" \
-        --dry-run=client -o yaml | kubectl apply -f -
+        # Secrets (idempotent)
+        DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
+        kubectl -n vikunja create secret generic vikunja-db-secret \
+          --from-literal=POSTGRES_PASSWORD="${DB_PASS}" \
+          --dry-run=client -o yaml | kubectl apply -f -
 
-      # Helm install/upgrade
-      helm repo add vikunja https://vikunja.github.io/helm-charts || true
-      helm repo update
-      helm upgrade --install vikunja vikunja/vikunja \
-        --namespace vikunja \
-        --wait --timeout 20m
+        kubectl -n vikunja create secret generic vikunja-app-secret \
+          --from-literal=DUMMY="ok" \
+          --dry-run=client -o yaml | kubectl apply -f -
 
-      kubectl -n vikunja get pods
-      kubectl -n vikunja get svc
+        # Helm repo + install/upgrade
+        helm repo add vikunja https://vikunja.github.io/helm-charts || true
+        helm repo update
+        helm upgrade --install vikunja vikunja/vikunja \
+          --namespace vikunja \
+          --wait --timeout 20m
 
-timeout: "3600s"
-
-# If your trigger uses a custom Service Account, this avoids the logs bucket requirement.
-options:
-  logging: CLOUD_LOGGING_ONLY
+        kubectl -n vikunja get pods
+        kubectl -n vikunja get svc
