@@ -71,6 +71,7 @@ steps:
         test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
 
         # Deploy/upgrade
-        /workspace/bin/helm upgrade --install vikunja ./helm/vikunja \
-          --namespace vikunja --create-namespace \
-          --wait --timeout 15m
+       /workspace/helm upgrade --install vikunja ./helm/vikunja \
+  --namespace vikunja --create-namespace \
+  --set-string db.password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
+  --wait --timeout 15m
