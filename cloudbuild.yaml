@@ -3,7 +3,6 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # Use gcloud image (has bash + kubectl). Do everything in ONE step.
   - id: "kubectl + helm deploy"
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
@@ -12,13 +11,12 @@ steps:
       - |
         set -o pipefail
 
-        # --- EDIT THESE 3 ONLY IF YOUR ENV DIFFERS ---
+        # Hard-coded since we removed trigger substitutions.
         PROJECT_ID="vikunja-case"
         REGION="europe-west4"
         CLUSTER_NAME="vikunja-autopilot"
-        # ---------------------------------------------
 
-        # Share kubeconfig via /workspace (always shared across steps; here we only have one step anyway)
+        # Kubeconfig kept in /workspace (shared within this step).
         export KUBECONFIG=/workspace/kubeconfig
 
         echo "Fetching cluster credentials..."
@@ -30,16 +28,11 @@ steps:
         kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
         kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-        echo "Installing Helm 3 (local to this step)..."
+        echo "Installing Helm 3..."
         curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
-        echo "Deploying with Helm (upgrade --install)..."
-        # If you keep your chart in repo at ./infra/helm (recommended)
+        echo "Deploying with Helm..."
+        # Adjust path if your chart lives elsewhere.
         helm upgrade --install vikunja ./infra/helm \
           --namespace vikunja \
           --atomic --wait
-
-        # If instead you use a remote chart repo, comment the above and use something like:
-        # helm repo add vikunja https://<your-helm-repo>
-        # helm repo update
-        # helm upgrade --install vikunja vikunja/vikunja -n vikunja --atomic --wait
