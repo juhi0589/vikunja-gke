@@ -1,7 +1,5 @@
 steps:
-# -------------------------------
 # 0) Terraform: create/update infra & write outputs we need for deploy
-# -------------------------------
 - name: hashicorp/terraform:1.9.6
   id: terraform apply + outputs
   entrypoint: /bin/sh
@@ -12,19 +10,22 @@ steps:
       terraform init -input=false
       terraform apply -auto-approve -input=false
 
-      # Export a small env file for the next step
-      cat > /workspace/env.out <<'EOF'
-      PROJECT_ID=${PROJECT_ID}
-      REGION=europe-west4
-      CLUSTER_NAME=vikunja-autopilot
-      INSTANCE_CONN_NAME=$(terraform output -raw instance_connection_name || true)
-      EOF
+      # Pull values from Terraform outputs and write an env file
+      PROJECT_ID="${PROJECT_ID}"                       # built-in
+      REGION="europe-west4"                            # set here (or make TF output if you want)
+      CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
+      INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name)"
+
+      cat > /workspace/env.out <<EOF
+PROJECT_ID=${PROJECT_ID}
+REGION=${REGION}
+CLUSTER_NAME=${CLUSTER_NAME}
+INSTANCE_CONN_NAME=${INSTANCE_CONN_NAME}
+EOF
       echo "Wrote /workspace/env.out:"
       cat /workspace/env.out
 
-# -------------------------------
 # 1) Kubectl + Helm: adopt namespace, create secrets idempotently, install chart
-# -------------------------------
 - name: gcr.io/cloud-builders/gcloud
   id: kubectl + helm deploy
   entrypoint: /bin/bash
@@ -32,8 +33,6 @@ steps:
     - -c
     - |
       set -euo pipefail
-
-      # Load values exported by step #0
       source /workspace/env.out
 
       echo "Using cluster: ${CLUSTER_NAME} in ${REGION}, project ${PROJECT_ID}"
@@ -47,13 +46,12 @@ steps:
       kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
       kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-      # Create/update secrets idempotently
+      # Secrets (idempotent)
       DB_PASS="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
       kubectl -n vikunja create secret generic vikunja-db-secret \
         --from-literal=POSTGRES_PASSWORD="${DB_PASS}" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      # (Optional) app secret to match your previous setup
       kubectl -n vikunja create secret generic vikunja-app-secret \
         --from-literal=DUMMY="ok" \
         --dry-run=client -o yaml | kubectl apply -f -
@@ -65,24 +63,11 @@ steps:
         --namespace vikunja \
         --wait --timeout 20m
 
-      # Show what came up
       kubectl -n vikunja get pods
       kubectl -n vikunja get svc
 
-# (Optional) print some context after build
-- name: gcr.io/cloud-builders/gcloud
-  id: show cluster & namespace
-  entrypoint: /bin/bash
-  args:
-    - -c
-    - |
-      set -euo pipefail
-      source /workspace/env.out
-      gcloud container clusters describe "${CLUSTER_NAME}" --region "${REGION}" --project "${PROJECT_ID}" >/dev/null && echo "Cluster OK"
-      kubectl get ns vikunja -o yaml | head -n 40 || true
-
 timeout: "3600s"
 
-# ---- Fix for custom service account builds: use Cloud Logging-only ----
+# If your trigger uses a custom Service Account, this avoids the logs bucket requirement.
 options:
   logging: CLOUD_LOGGING_ONLY
