@@ -1,41 +1,52 @@
-# --- image & replicas ---
-image:
-  repository: vikunja/vikunja
-  tag: latest
-  pullPolicy: IfNotPresent
-
 replicaCount: 1
 
-# --- service ---
+image:
+  repository: vikunja/vikunja
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
 service:
   type: ClusterIP
   port: 80
   targetPort: 3456
 
-# --- database (required by templates) ---
+# Database settings used by the app. We'll still inject the actual password
+# from Secret Manager at deploy time via --set-string db.password=...
 db:
   host: "34.147.70.155"   # <-- your Cloud SQL public IP
   port: 5432
   name: "vikunja"
   user: "vikunja"
-  # DO NOT hardcode the password here; it will be injected from Secret Manager via --set at deploy time.
-  # password: ""
+  password: ""            # leave empty; set by Cloud Build step
 
-# --- storage (required by pvc.yaml) ---
+# PVC settings (your chart references storage.size)
 storage:
   enabled: true
-  size: 10Gi
-  # On GKE Autopilot the default SC is usually "standard-rwo" (check with: kubectl get sc)
-  storageClassName: "standard-rwo"
+  size: 1Gi
+  # storageClassName: ""   # optional; omit to use cluster default
 
-# --- ingress (enable it) ---
+# Ingress settings (your chart references ingress.enabled)
 ingress:
   enabled: true
-  className: "gce"     # GKE's GLBC ingress class
+  className: "gce"        # GKE classic Ingress. Use "gce" unless you run another controller.
   annotations: {}
   hosts:
-    - host: "vikunja.example.com"    # <-- put your real domain here
+    - host: "vikunja.example.com"   # <-- put your real DNS name, or leave as placeholder
       paths:
         - path: /
           pathType: Prefix
-  tls: []  # add a managed cert later if you have one
+  tls: []                  # add tls config if you have certs
+
+# Define cloudsql.* even if you aren't using the proxy
+# (chart template reads cloudsql.image)
+cloudsql:
+  enabled: false
+  image: "gcr.io/cloud-sql-connectors/cloud-sql-proxy"
+  tag: "2.11.3"
+  instanceConnectionName: ""    # only needed if enabled=true
+  port: 5432
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
