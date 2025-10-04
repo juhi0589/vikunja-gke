@@ -1,4 +1,6 @@
 apiVersion: v2
 name: vikunja
+description: Minimal chart to deploy Vikunja
+type: application
 version: 0.1.0
-appVersion: "0.22.0"
+appVersion: "latest"
