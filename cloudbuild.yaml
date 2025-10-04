@@ -14,12 +14,26 @@ steps:
     - |
       set -eu
 
-      terraform init -input=false
-      terraform apply -input=false -auto-approve
+      # Find a directory containing .tf files (prefer repo root, else search up to 3 levels)
+      if ls -1 *.tf >/dev/null 2>&1; then
+        TFDIR="."
+      else
+        TFDIR="$(dirname "$(find . -mindepth 1 -maxdepth 3 -type f -name '*.tf' ! -path '*/.terraform/*' -print -quit)")"
+      fi
+
+      if [ -z "${TFDIR:-}" ] || [ "${TFDIR}" = "." -a ! -e "*.tf" ]; then
+        echo "❌ No Terraform files found in repo root or subdirs (depth<=3)."
+        exit 1
+      fi
+
+      echo "Using Terraform directory: ${TFDIR}"
+
+      terraform -chdir="${TFDIR}" init -input=false
+      terraform -chdir="${TFDIR}" apply -input=false -auto-approve
 
       # Read Terraform outputs
-      CLUSTER_NAME="$(terraform output -raw gke_autopilot_name)"
-      INSTANCE_CONN_NAME="$(terraform output -raw instance_connection_name)"
+      CLUSTER_NAME="$(terraform -chdir="${TFDIR}" output -raw gke_autopilot_name)"
+      INSTANCE_CONN_NAME="$(terraform -chdir="${TFDIR}" output -raw instance_connection_name)"
 
       # Persist for the next step (escape $ so Cloud Build doesn't pre-substitute)
       {
@@ -47,8 +61,13 @@ steps:
         --filter="name=$$CLUSTER_NAME" \
         --format="value(location)")"
 
+      if [ -z "$REGION" ]; then
+        echo "❌ Could not find region for cluster $$CLUSTER_NAME"
+        exit 1
+      fi
+
       echo "Using cluster $$CLUSTER_NAME in $$REGION (project $PROJECT_ID)"
-      gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$$REGION" --project "$PROJECT_ID"
+      gcloud container clusters get-credentials "$$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID"
 
       # Ensure namespace exists and is owned by Helm (avoids the ownership error)
       kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
@@ -71,7 +90,7 @@ steps:
         --from-literal=VIKUNJA_JWT_SECRET="$$JWT_SECRET" \
         --dry-run=client -o yaml | kubectl apply -f -
 
-      # Deploy chart (assumes your chart is in ./helm/vikunja)
+      # Deploy chart (adjust path if your chart lives elsewhere)
       helm version
       helm upgrade --install vikunja ./helm/vikunja \
         --namespace vikunja \
