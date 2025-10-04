@@ -2,7 +2,7 @@ options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # 0) Get kube creds for the GKE cluster
+  # 0) Get kubeconfig for your cluster
   - name: gcr.io/cloud-builders/gcloud
     id: get-credentials
     entrypoint: bash
@@ -13,7 +13,7 @@ steps:
           --region europe-west4 \
           --project vikunja-case
 
-  # 1) Ensure namespace exists + make it Helm-adoptable
+  # 1) Ensure namespace exists and is Helm-adoptable
   - name: gcr.io/cloud-builders/gcloud
     id: prepare-namespace
     entrypoint: bash
@@ -21,152 +21,23 @@ steps:
       - -ceu
       - |
         kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
-
-        # Labels/annotations so Helm can own resources without the "invalid ownership metadata" error
         kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite=true || true
         kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite=true || true
         kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite=true || true
 
-  # 2) Make sure the DB secret exists from Secret Manager
-  - name: gcr.io/cloud-builders/gcloud
-    id: create-secrets
-    entrypoint: bash
-    args:
-      - -ceu
-      - |
-        DBPASS=$$(gcloud secrets versions access latest --secret="vikunja-db-password" 2>/dev/null || true)
-        kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=password="$${DBPASS}" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
-  # 3) Helm deploy:
-  #    - Use ./helm if it exists
-  #    - else auto-generate a minimal working chart so the build doesn't fail on "Chart not found"
+  # 2) Helm deploy the local chart in ./helm
   - name: gcr.io/cloud-builders/gcloud
     id: helm-deploy
     entrypoint: bash
     args:
       - -ceu
       - |
-        set -o pipefail
-
-        # Install Helm into this container
         HELM_VERSION="v3.14.4"
-        curl -sSL https://get.helm.sh/helm-$${HELM_VERSION}-linux-amd64.tar.gz \
-          | tar -xz && mv linux-amd64/helm /usr/local/bin/helm && helm version
+        curl -sSL https://get.helm.sh/helm-$${HELM_VERSION}-linux-amd64.tar.gz | tar -xz
+        mv linux-amd64/helm /usr/local/bin/helm
+        helm version
 
-        # Decide which chart to use
-        if [ -f ./helm/Chart.yaml ]; then
-          CHART_DIR=./helm
-        elif [ -f ./charts/vikunja/Chart.yaml ]; then
-          CHART_DIR=./charts/vikunja
-        else
-          CHART_DIR=/workspace/_generated_chart
-          mkdir -p "$${CHART_DIR}/templates"
-
-          # Minimal chart: runs Vikunja with sqlite so you get a running app even without a DB config
-          cat > "$${CHART_DIR}/Chart.yaml" <<'EOF'
-apiVersion: v2
-name: vikunja
-description: Minimal chart to deploy Vikunja single container
-type: application
-version: 0.1.0
-appVersion: "latest"
-EOF
-
-          cat > "$${CHART_DIR}/values.yaml" <<'EOF'
-image:
-  repository: vikunja/vikunja
-  tag: latest
-  pullPolicy: IfNotPresent
-
-replicaCount: 1
-
-service:
-  type: ClusterIP
-  port: 80
-  targetPort: 3456
-
-resources: {}
-
-nodeSelector: {}
-tolerations: []
-affinity: {}
-EOF
-
-          cat > "$${CHART_DIR}/templates/deployment.yaml" <<'EOF'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: vikunja
-  labels:
-    app.kubernetes.io/name: vikunja
-    app.kubernetes.io/instance: vikunja
-spec:
-  replicas: {{ .Values.replicaCount }}
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: vikunja
-      app.kubernetes.io/instance: vikunja
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: vikunja
-        app.kubernetes.io/instance: vikunja
-    spec:
-      containers:
-        - name: vikunja
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - containerPort: {{ .Values.service.targetPort }}
-          env:
-            # Use sqlite so the app starts even without DB wiring.
-            - name: VIKUNJA_DATABASE_TYPE
-              value: sqlite
-            # If you want Postgres, swap to:
-            # - name: VIKUNJA_DATABASE_TYPE
-            #   value: postgres
-            # - name: VIKUNJA_DATABASE_HOST
-            #   value: 127.0.0.1
-            # - name: VIKUNJA_DATABASE_USER
-            #   value: vikunja
-            # - name: VIKUNJA_DATABASE_PASSWORD
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: vikunja-db-secret
-            #       key: password
-            # - name: VIKUNJA_DATABASE_DATABASE
-            #   value: vikunja
-          volumeMounts:
-            - name: data
-              mountPath: /app/vikunja
-      volumes:
-        - name: data
-          emptyDir: {}
-EOF
-
-          cat > "$${CHART_DIR}/templates/service.yaml" <<'EOF'
-apiVersion: v1
-kind: Service
-metadata:
-  name: vikunja
-  labels:
-    app.kubernetes.io/name: vikunja
-    app.kubernetes.io/instance: vikunja
-spec:
-  type: {{ .Values.service.type }}
-  selector:
-    app.kubernetes.io/name: vikunja
-    app.kubernetes.io/instance: vikunja
-  ports:
-    - name: http
-      port: {{ .Values.service.port }}
-      targetPort: {{ .Values.service.targetPort }}
-EOF
-        fi
-
-        # Deploy/upgrade
-        helm upgrade --install vikunja "$${CHART_DIR}" \
+        # Deploy (uses sqlite so the app starts without DB wiring)
+        helm upgrade --install vikunja ./helm \
           -n vikunja \
           --wait --timeout 10m
