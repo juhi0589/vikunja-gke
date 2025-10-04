@@ -1,9 +1,9 @@
-timeout: "1200s"
+timeout: "1800s"
 options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # Prep: set env and verify the tfstate bucket exists (no creation)
+  # 1) Prepare env and verify the tfstate bucket exists (no creation here)
   - id: prepare-env
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
@@ -19,20 +19,20 @@ steps:
         TFSTATE_PREFIX="gke"
 
         echo "Checking bucket: gs://${TFSTATE_BUCKET}"
-        gcloud storage buckets describe "gs://${TFSTATE_BUCKET}" >/dev/null
+        gsutil ls -b "gs://${TFSTATE_BUCKET}" >/dev/null
 
-        cat > /workspace/env.sh <<EOF
-export PROJECT_ID=${PROJECT_ID}
-export REGION=${REGION}
-export CLUSTER_NAME=${CLUSTER_NAME}
-export TFSTATE_BUCKET=${TFSTATE_BUCKET}
-export TFSTATE_PREFIX=${TFSTATE_PREFIX}
-EOF
+        {
+          echo "export PROJECT_ID=${PROJECT_ID}"
+          echo "export REGION=${REGION}"
+          echo "export CLUSTER_NAME=${CLUSTER_NAME}"
+          echo "export TFSTATE_BUCKET=${TFSTATE_BUCKET}"
+          echo "export TFSTATE_PREFIX=${TFSTATE_PREFIX}"
+        } > /workspace/env.sh
         chmod +x /workspace/env.sh
         echo "Wrote /workspace/env.sh"
 
-  # Terraform: init + apply using the existing bucket
-  - id: terraform apply
+  # 2) Terraform init/apply using existing bucket backend
+  - id: terraform-apply
     name: hashicorp/terraform:1.9.6
     entrypoint: sh
     args:
@@ -40,6 +40,8 @@ EOF
       - |
         set -euo pipefail
         . /workspace/env.sh
+
+        test -d infra/terraform || { echo "ERROR: infra/terraform not found"; exit 1; }
 
         terraform -chdir=infra/terraform init \
           -input=false \
@@ -50,8 +52,8 @@ EOF
           -var="project_id=${PROJECT_ID}" \
           -var="region=${REGION}"
 
-  # Deploy: get kube creds, prep namespace for Helm adoption, create secrets, helm upgrade
-  - id: kubectl + helm deploy
+  # 3) Get kube creds, prep namespace for Helm adoption, create secrets
+  - id: k8s-preflight
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
     args:
@@ -60,26 +62,20 @@ EOF
         set -euo pipefail
         . /workspace/env.sh
 
+        export KUBECONFIG=/workspace/kubeconfig
+        mkdir -p "$(dirname "${KUBECONFIG}")"
+
         echo "Getting cluster credentials..."
         gcloud container clusters get-credentials "${CLUSTER_NAME}" --region "${REGION}"
 
-        echo "Ensuring namespace with Helm adoption labels/annotations..."
-        kubectl apply -f - <<'NS'
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: vikunja
-  labels:
-    app.kubernetes.io/managed-by: Helm
-  annotations:
-    meta.helm.sh/release-name: vikunja
-    meta.helm.sh/release-namespace: vikunja
-NS
+        echo "Ensure namespace exists and is Helm-adoptable..."
+        kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
+        kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
+        kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja --overwrite
+        kubectl annotate ns vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-        echo "Creating/updating secrets..."
-        # Requires Secret Manager access on this SA for 'vikunja-db-password'
+        echo "Create/Update secrets..."
         DB_PASSWORD="$(gcloud secrets versions access latest --secret='vikunja-db-password')"
-        # Simple random app secret
         APP_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
         kubectl -n vikunja create secret generic vikunja-db-secret \
@@ -90,11 +86,20 @@ NS
           --from-literal=JWT_SECRET="${APP_SECRET}" \
           --dry-run=client -o yaml | kubectl apply -f -
 
-        echo "Helm version:"
-        helm version
+  # 4) Helm install/upgrade (separate Helm builder; reuses kubeconfig from workspace)
+  - id: helm-deploy
+    name: gcr.io/cloud-builders/helm
+    env:
+      - KUBECONFIG=/workspace/kubeconfig
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -euo pipefail
 
-        echo "Installing/upgrading Helm release..."
-        # Assumes the chart lives at ./helm/vikunja in your repo
+        test -d helm/vikunja || { echo "ERROR: helm/vikunja chart path not found"; exit 1; }
+
+        helm version
         helm upgrade --install vikunja ./helm/vikunja \
           --namespace vikunja \
           --wait --timeout 10m
