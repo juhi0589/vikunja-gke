@@ -1,6 +1,5 @@
 options:
   logging: CLOUD_LOGGING_ONLY
-  substitution_option: ALLOW_LOOSE
 
 steps:
   # 0) Get GKE credentials and persist kubeconfig for later steps
@@ -8,23 +7,25 @@ steps:
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
     args:
-      - -ceu
+      - -c
       - |
+        set -euo pipefail
         gcloud container clusters get-credentials vikunja-autopilot \
           --region europe-west4 \
           --project vikunja-case
         mkdir -p /workspace/.kube
         cp -f /builder/home/.kube/config /workspace/.kube/config
 
-  # 1) Prepare namespace and make it Helm-adoptable
+  # 1) Create/label/annotate namespace so Helm can manage it
   - id: prepare-namespace
     name: gcr.io/cloud-builders/gcloud
     env:
       - KUBECONFIG=/workspace/.kube/config
     entrypoint: bash
     args:
-      - -ceu
+      - -c
       - |
+        set -euo pipefail
         kubectl get ns vikunja >/dev/null 2>&1 || kubectl create ns vikunja
         kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
         kubectl annotate ns vikunja \
@@ -38,35 +39,34 @@ steps:
       - KUBECONFIG=/workspace/.kube/config
     entrypoint: bash
     args:
-      - -ceu
+      - -c
       - |
+        set -euo pipefail
         kubectl -n vikunja create secret generic vikunja-db-secret \
           --from-literal=postgresql-password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
           --dry-run=client -o yaml | kubectl apply -f -
 
   # 3) Download Helm (no registry pull) and deploy the local chart at ./helm/vikunja
-  # 3) Download Helm and deploy the local chart at ./helm/vikunja
-- id: helm-deploy
-  name: gcr.io/cloud-builders/gcloud
-  env:
-    - KUBECONFIG=/workspace/.kube/config
-  entrypoint: bash
-  args:
-    - -ceu
-    - |
-      set -euo pipefail
-      rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
-      mkdir -p /workspace/bin
-      curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
-      tar -xzf /workspace/helm.tgz -C /workspace
-      mv /workspace/linux-amd64/helm /workspace/bin/helm
-      chmod +x /workspace/bin/helm
-      /workspace/bin/helm version
+  - id: helm-deploy
+    name: gcr.io/cloud-builders/gcloud
+    env:
+      - KUBECONFIG=/workspace/.kube/config
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
+        mkdir -p /workspace/bin
+        curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
+        tar -xzf /workspace/helm.tgz -C /workspace
+        mv /workspace/linux-amd64/helm /workspace/bin/helm
+        chmod +x /workspace/bin/helm
+        /workspace/bin/helm version
 
-      test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
+        test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
 
-      /workspace/bin/helm upgrade --install vikunja ./helm/vikunja \
-        --namespace vikunja --create-namespace \
-        --set db.secretName=vikunja-db-secret \
-        --set db.secretKey=postgresql-password \
-        --wait --timeout 15m
+        /workspace/bin/helm upgrade --install vikunja ./helm/vikunja \
+          --namespace vikunja --create-namespace \
+          -f ./helm/vikunja/values.yaml \
+          --wait --timeout 15m
