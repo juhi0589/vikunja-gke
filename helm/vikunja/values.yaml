@@ -1,50 +1,77 @@
-replicaCount: 1
-
-api:
-  image:
+# --- Images (the chart expects separate api & frontend images) ---
+image:
+  api:
     repository: vikunja/api
-    tag: "latest"
+    tag: "latest"           # pin if you prefer: e.g. "0.23.0"
+    pullPolicy: IfNotPresent
+  frontend:
+    repository: vikunja/frontend
+    tag: "latest"           # pin if you prefer
     pullPolicy: IfNotPresent
 
-service:
-  type: ClusterIP
-  port: 80
-  targetPort: 3456
+# --- Replicas (if your chart supports per-component replicas) ---
+replicaCount:
+  api: 1
+  frontend: 1
 
+# --- Services (api & frontend) ---
+service:
+  api:
+    type: ClusterIP
+    port: 3456
+    targetPort: 3456
+  frontend:
+    type: ClusterIP
+    port: 80
+    targetPort: 80
+
+# --- Database settings used by the api deployment template ---
 db:
-  host: "34.147.70.155"          # your Cloud SQL public IP
+  host: "34.147.70.155"         # gcloud sql instances describe ... --format="value(ipAddresses[0].ipAddress)"
   port: 5432
   name: "vikunja"
   user: "vikunja"
-  # Tell the chart which Secret holds the password
-  secretName: "vikunja-db-secret"
-  secretKey: "postgresql-password"
+  # We create this secret in Cloud Build step 2
+  passwordSecretName: "vikunja-db-secret"
+  passwordSecretKey: "postgresql-password"
 
+# --- Cloud SQL sidecar (turn OFF because you connect via public IP above) ---
+cloudsql:
+  enabled: false
+  # If you later want to use the proxy, set enabled: true and fill these:
+  image: "gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.11.4"
+  instance: "vikunja-case:europe-west4:vikunja-pg"
+  extraArgs: []   # e.g.: ["--private-ip"]
+
+# --- Persistent Volume Claim expected by pvc.yaml ---
 storage:
   enabled: true
-  size: 1Gi
-  # storageClassName: ""         # optional
+  size: "5Gi"
+  storageClassName: "standard-rwo"   # GKE Autopilot default
+  accessModes:
+    - ReadWriteOnce
 
+# --- Ingress used by ingress.yaml ---
 ingress:
   enabled: true
-  className: "gce"
+  className: "gce"                   # GKE Ingress
   annotations: {}
   hosts:
-    - host: "vikunja.example.com"    # change to your DNS or keep placeholder
+    # If you don't have a domain yet, you can leave host empty ("") for path-based routing.
+    - host: ""                       # set to your FQDN later, e.g. vikunja.yourdomain.com
       paths:
         - path: /
           pathType: Prefix
-  tls: []                             # add TLS when ready
+          # Some charts derive service & port automatically; these placeholders keep templates happy.
+          serviceName: "vikunja-frontend"
+          servicePort: 80
+  tls: []                             # add a managed cert later if you use a hostname
 
-# Define even if you don't use the proxy (chart references cloudsql.image)
-cloudsql:
-  enabled: false
-  image: "gcr.io/cloud-sql-connectors/cloud-sql-proxy"
-  tag: "2.11.3"
-  instanceConnectionName: ""
-  port: 5432
+# --- Optional environment for frontend to reach the api (if your chart supports it) ---
+frontend:
+  env:
+    API_URL: "http://vikunja-api.vikunja.svc.cluster.local:3456"
 
-resources: {}
-nodeSelector: {}
-tolerations: []
-affinity: {}
+# --- Optional extra env for api (chart may already inject db.* automatically) ---
+api:
+  env: {}
