@@ -45,31 +45,28 @@ steps:
           --dry-run=client -o yaml | kubectl apply -f -
 
   # 3) Download Helm (no registry pull) and deploy the local chart at ./helm/vikunja
-  - id: helm-deploy
-    name: gcr.io/cloud-builders/gcloud
-    env:
-      - KUBECONFIG=/workspace/.kube/config
-    entrypoint: bash
-    args:
-      - -ceu
-      - |
-        set -euo pipefail
+  # 3) Download Helm and deploy the local chart at ./helm/vikunja
+- id: helm-deploy
+  name: gcr.io/cloud-builders/gcloud
+  env:
+    - KUBECONFIG=/workspace/.kube/config
+  entrypoint: bash
+  args:
+    - -ceu
+    - |
+      set -euo pipefail
+      rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
+      mkdir -p /workspace/bin
+      curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
+      tar -xzf /workspace/helm.tgz -C /workspace
+      mv /workspace/linux-amd64/helm /workspace/bin/helm
+      chmod +x /workspace/bin/helm
+      /workspace/bin/helm version
 
-        rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
-        mkdir -p /workspace/bin
+      test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
 
-        curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
-        tar -xzf /workspace/helm.tgz -C /workspace
-        mv /workspace/linux-amd64/helm /workspace/bin/helm
-        chmod +x /workspace/bin/helm
-        /workspace/bin/helm version
-
-        # Ensure the chart exists
-        test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
-
-        # Deploy/upgrade
-        /workspace/bin/helm upgrade --install vikunja ./helm/vikunja \
-          --namespace vikunja --create-namespace \
-          -f ./helm/vikunja/values.yaml \
-          --set-string db.password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
-          --wait --timeout 15m
+      /workspace/bin/helm upgrade --install vikunja ./helm/vikunja \
+        --namespace vikunja --create-namespace \
+        --set db.secretName=vikunja-db-secret \
+        --set db.secretKey=postgresql-password \
+        --wait --timeout 15m
