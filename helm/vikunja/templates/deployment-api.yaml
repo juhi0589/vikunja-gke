@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vikunja-api
-  namespace: vikunja
   labels:
     app: vikunja-api
 spec:
@@ -15,50 +14,51 @@ spec:
       labels:
         app: vikunja-api
     spec:
-      serviceAccountName: vikunja-api
       containers:
-      - name: api
-        image: {{ .Values.image.api | quote }}
-        ports:
-        - containerPort: 3456
-        env:
-        - name: VIKUNJA_DATABASE_TYPE
-          value: "postgres"
-        - name: VIKUNJA_DATABASE_HOST
-          value: {{ .Values.db.host | quote }}
-        - name: VIKUNJA_DATABASE_PORT
-          value: {{ .Values.db.port | quote }}
-        - name: VIKUNJA_DATABASE_DATABASE
-          value: {{ .Values.db.name | quote }}
-        - name: VIKUNJA_DATABASE_USER
-          value: {{ .Values.db.user | quote }}
-        - name: VIKUNJA_DATABASE_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: {{ .Values.db.passwordSecretName }}
-              key: POSTGRES_PASSWORD
-        - name: VIKUNJA_SERVICE_JWTSECRET
-          valueFrom:
-            secretKeyRef:
-              name: vikunja-app-secret
-              key: VIKUNJA_SERVICE_JWTSECRET
-        volumeMounts:
-        - name: files
-          mountPath: /app/vikunja/files
-        readinessProbe:
-          httpGet: { path: /api/v1/info, port: 3456 }
-          initialDelaySeconds: 10
-        livenessProbe:
-          httpGet: { path: /api/v1/info, port: 3456 }
-          initialDelaySeconds: 20
-      - name: cloud-sql-proxy
-        image: {{ .Values.cloudsql.image | quote }}
-        args:
-          - "--port=5432"
-          - "{{ .Values.cloudsql.instanceConnectionName }}"
-        securityContext:
-          runAsNonRoot: true
+        - name: api
+          image: "{{ .Values.image.api.repository }}:{{ .Values.image.api.tag }}"
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.api.port }}
+          env:
+            - name: VIKUNJA_DATABASE_TYPE
+              value: postgres
+            - name: VIKUNJA_DATABASE_HOST
+              value: "{{ .Values.db.host }}"
+            - name: VIKUNJA_DATABASE_PORT
+              value: "{{ .Values.db.port }}"
+            - name: VIKUNJA_DATABASE_DATABASE
+              value: "{{ .Values.db.name }}"
+            - name: VIKUNJA_DATABASE_USER
+              value: "{{ .Values.db.user }}"
+            - name: VIKUNJA_DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.db.passwordSecretName }}
+                  key: {{ .Values.db.passwordSecretKey }}
+            - name: VIKUNJA_SERVICE_JWTSECRET
+              valueFrom:
+                secretKeyRef:
+                  name: vikunja-app-secret
+                  key: VIKUNJA_SERVICE_JWTSECRET
+          volumeMounts:
+            - name: files
+              mountPath: /app/vikunja/files
+          readinessProbe:
+            httpGet:
+              path: /api/v1/info
+              port: {{ .Values.service.api.port }}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/info
+              port: {{ .Values.service.api.port }}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources.api | nindent 12 }}
       volumes:
-      - name: files
-        persistentVolumeClaim:
-          claimName: vikunja-files
+        - name: files
+          persistentVolumeClaim:
+            claimName: vikunja-files
