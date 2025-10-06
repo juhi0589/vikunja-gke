@@ -13,7 +13,6 @@ steps:
       --region europe-west4 \
       --project vikunja-case
 
-    # persist kubeconfig for next steps
     mkdir -p /workspace/.kube
     cp -f /builder/home/.kube/config /workspace/.kube/config
 
@@ -54,7 +53,6 @@ steps:
   - |
     set -euo pipefail
 
-    # Install helm into /workspace/bin
     rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
     mkdir -p /workspace/bin
     curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
@@ -63,18 +61,14 @@ steps:
     chmod +x /workspace/bin/helm
     /workspace/bin/helm version
 
-    # Absolute chart path debug + deploy
-    CHART_DIR="/workspace/helm/vikunja"
-    echo "pwd: $(pwd)"
-    echo "Top-level:"; ls -la /workspace
-    echo "helm dir:";  ls -la /workspace/helm || true
-    echo "chart dir:"; ls -la "${CHART_DIR}" || true
-
-    if [ ! -f "${CHART_DIR}/Chart.yaml" ]; then
-      echo "ERROR: Chart not found at ${CHART_DIR}"
+    # Verify the chart exists and deploy it
+    if [ ! -f "/workspace/helm/vikunja/Chart.yaml" ]; then
+      echo "ERROR: Chart not found at /workspace/helm/vikunja"
+      echo "pwd: $(pwd)"; echo "Top-level:"; ls -la /workspace
+      echo "helm dir:";  ls -la /workspace/helm || true
       exit 1
     fi
 
-    /workspace/bin/helm upgrade --install vikunja "${CHART_DIR}" \
+    /workspace/bin/helm upgrade --install vikunja "/workspace/helm/vikunja" \
       --namespace vikunja --create-namespace \
       --wait --timeout 15m
