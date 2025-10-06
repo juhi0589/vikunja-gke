@@ -4,6 +4,7 @@ options:
 steps:
 - id: get-credentials
   name: gcr.io/cloud-builders/gcloud
+  dir: .
   entrypoint: bash
   args:
   - -ceu
@@ -18,6 +19,7 @@ steps:
 
 - id: prepare-namespace
   name: gcr.io/cloud-builders/gcloud
+  dir: .
   env:
   - KUBECONFIG=/workspace/.kube/config
   entrypoint: bash
@@ -30,6 +32,7 @@ steps:
 
 - id: create-secrets
   name: gcr.io/cloud-builders/gcloud
+  dir: .
   env:
   - KUBECONFIG=/workspace/.kube/config
   entrypoint: bash
@@ -42,7 +45,7 @@ steps:
 
 - id: helm-deploy
   name: gcr.io/cloud-builders/gcloud
-  workingDir: /workspace
+  dir: .
   env:
   - KUBECONFIG=/workspace/.kube/config
   entrypoint: bash
@@ -51,7 +54,7 @@ steps:
   - |
     set -euo pipefail
 
-    # Install helm into /workspace/bin (avoid naming collisions)
+    # Install helm into /workspace/bin
     rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
     mkdir -p /workspace/bin
     curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
@@ -60,9 +63,8 @@ steps:
     chmod +x /workspace/bin/helm
     /workspace/bin/helm version
 
-    # Absolute chart path + quick listing for debugging
+    # Absolute chart path debug + deploy
     CHART_DIR="/workspace/helm/vikunja"
-
     echo "pwd: $(pwd)"
     echo "Top-level:"; ls -la /workspace
     echo "helm dir:";  ls -la /workspace/helm || true
