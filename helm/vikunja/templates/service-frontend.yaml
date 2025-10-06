@@ -1,12 +1,27 @@
-apiVersion: v1
-kind: Service
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: vikunja-frontend
-  namespace: vikunja
-spec:
-  type: ClusterIP
-  selector:
+  labels:
     app: vikunja-frontend
-  ports:
-  - port: 80
-    targetPort: 80
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vikunja-frontend
+  template:
+    metadata:
+      labels:
+        app: vikunja-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: "{{ .Values.image.frontend.repository }}:{{ .Values.image.frontend.tag }}"
+          imagePullPolicy: {{ .Values.image.frontend.pullPolicy }}
+          ports:
+            - containerPort: 80
+          env:
+            - name: VIKUNJA_API_URL
+              value: "http://vikunja-api:{{ .Values.service.api.port }}"
+          resources:
+            {{- toYaml .Values.resources.frontend | nindent 12 }}
