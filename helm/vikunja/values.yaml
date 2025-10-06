@@ -1,4 +1,4 @@
-# --- Images (the chart expects separate api & frontend images)3---
+# --- Images (the chart expects separate api & frontend images)5---
 image:
   api:
     repository: vikunja/api
