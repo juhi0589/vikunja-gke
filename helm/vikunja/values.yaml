@@ -1,13 +1,9 @@
 # --- Images (the chart expects separate api & frontend images)5---
+# --- Images (the chart expects separate api & frontend images)
 image:
-  api:
-    repository: vikunja/api
-    tag: "latest"           # pin if you prefer: e.g. "0.23.0"
-    pullPolicy: IfNotPresent
-  frontend:
-    repository: vikunja/frontend
-    tag: "latest"           # pin if you prefer
-    pullPolicy: IfNotPresent
+  api: "vikunja/api:latest"
+  frontend: "vikunja/frontend:latest"
+  pullPolicy: IfNotPresent
 
 # --- Replicas (if your chart supports per-component replicas) ---
 replicaCount:
