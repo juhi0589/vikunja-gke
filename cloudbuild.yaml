@@ -1,9 +1,8 @@
-#First Attempt
 options:
   logging: CLOUD_LOGGING_ONLY
 
 steps:
-  # 0) Get GKE creds and persist kubeconfig for later steps
+  # 0) Get GKE credentials and persist kubeconfig for later steps
   - id: get-credentials
     name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
@@ -16,7 +15,7 @@ steps:
         mkdir -p /workspace/.kube
         cp -f /builder/home/.kube/config /workspace/.kube/config
 
-  # 1) Make namespace Helm-adoptable (prevents "invalid ownership" error)
+  # 1) Prepare namespace and make it Helm-adoptable
   - id: prepare-namespace
     name: gcr.io/cloud-builders/gcloud
     env:
@@ -29,8 +28,8 @@ steps:
         kubectl label ns vikunja app.kubernetes.io/managed-by=Helm --overwrite
         kubectl annotate ns vikunja meta.helm.sh/release-name=vikunja meta.helm.sh/release-namespace=vikunja --overwrite
 
-  # 2) Create/Update secrets
-  - id: create-secrets
+  # 2) Create/Update DB secret (provide BOTH key names to match your manifest)
+  - id: create-db-secret
     name: gcr.io/cloud-builders/gcloud
     env:
       - KUBECONFIG=/workspace/.kube/config
@@ -38,19 +37,52 @@ steps:
     args:
       - -ceu
       - |
-        # DB password from Secret Manager -> K8s secret
+        DBP="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
         kubectl -n vikunja create secret generic vikunja-db-secret \
-          --from-literal=postgresql-password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
+          --from-literal=POSTGRES_PASSWORD="$DBP" \
+          --from-literal=postgresql-password="$DBP" \
           --dry-run=client -o yaml | kubectl apply -f -
 
-        # App JWT secret (create once if missing)
-        if ! kubectl -n vikunja get secret vikunja-app-secret >/dev/null 2>&1; then
-          kubectl -n vikunja create secret generic vikunja-app-secret \
-            --from-literal=VIKUNJA_SERVICE_JWTSECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
-            --dry-run=client -o yaml | kubectl apply -f -
-        fi
+  # 3) App secret for JWT (required by the API)
+  - id: create-app-secret
+    name: gcr.io/cloud-builders/gcloud
+    env:
+      - KUBECONFIG=/workspace/.kube/config
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        JWT="$(head -c 32 /dev/urandom | base64 | tr -d '\n' || echo tempsecret)"
+        kubectl -n vikunja create secret generic vikunja-app-secret \
+          --from-literal=VIKUNJA_SERVICE_JWTSECRET="$JWT" \
+          --dry-run=client -o yaml | kubectl apply -f -
 
-  # 3) Download Helm (no registry auth), then deploy the local chart
+  # 4) Create the PVC that the Deployment expects
+  - id: create-pvc
+    name: gcr.io/cloud-builders/gcloud
+    env:
+      - KUBECONFIG=/workspace/.kube/config
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        cat > /workspace/pvc.yaml <<'EOF'
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: vikunja-files
+          namespace: vikunja
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 5Gi
+          storageClassName: standard-rwo
+        EOF
+        kubectl apply -f /workspace/pvc.yaml
+
+  # 5) Download Helm (no registry auth needed) and deploy the chart at ./helm/vikunja
   - id: helm-deploy
     name: gcr.io/cloud-builders/gcloud
     env:
@@ -60,16 +92,15 @@ steps:
       - -ceu
       - |
         set -euo pipefail
-        rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
-        mkdir -p /workspace/bin
+        rm -rf /workspace/linux-amd64 /workspace/helm.tgz
         curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
         tar -xzf /workspace/helm.tgz -C /workspace
-        mv /workspace/linux-amd64/helm /workspace/bin/helm
-        chmod +x /workspace/bin/helm
-        /workspace/bin/helm version
+        /workspace/linux-amd64/helm version
 
-        test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
+        test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not at ./helm/vikunja"; exit 1; }
 
-        /workspace/bin/helm upgrade --install vikunja ./helm/vikunja \
+        # Deploy/upgrade; pass DB password into values if your chart uses .Values.db.password
+        /workspace/linux-amd64/helm upgrade --install vikunja ./helm/vikunja \
           --namespace vikunja --create-namespace \
-          --wait --timeout 20m
+          --wait --timeout 20m \
+          --set-string db.password="$(gcloud secrets versions access latest --secret=vikunja-db-password)"
