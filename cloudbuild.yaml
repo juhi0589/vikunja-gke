@@ -52,37 +52,42 @@ steps:
         fi
 
   # 3) Download Helm (no registry pulls) and deploy the local chart at ./helm/vikunja
-  - id: helm-deploy
-    name: gcr.io/cloud-builders/gcloud
-    env:
-      - KUBECONFIG=/workspace/.kube/config
-    entrypoint: bash
-    args:
-      - -ceu
-      - |
-        set -euo pipefail
+ # 3) Download Helm and deploy the chart
+- id: helm-deploy
+  name: gcr.io/cloud-builders/gcloud
+  workingDir: /workspace
+  env:
+    - KUBECONFIG=/workspace/.kube/config
+  entrypoint: bash
+  args:
+    - -ceu
+    - |
+      set -euo pipefail
 
-        # Clean any leftovers, fetch helm
-        rm -rf /workspace/linux-amd64 /workspace/helm /workspace/helm.tgz
-        curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
-        tar -xzf /workspace/helm.tgz -C /workspace
-        mv /workspace/linux-amd64/helm /workspace/helm && chmod +x /workspace/helm
-        /workspace/helm version
+      # ---- install helm binary in /workspace/bin (not /workspace/helm) ----
+      rm -rf /workspace/bin /workspace/linux-amd64 /workspace/helm.tgz
+      mkdir -p /workspace/bin
+      curl -fsSL "https://get.helm.sh/helm-v3.14.4-linux-amd64.tar.gz" -o /workspace/helm.tgz
+      tar -xzf /workspace/helm.tgz -C /workspace
+      mv /workspace/linux-amd64/helm /workspace/bin/helm
+      chmod +x /workspace/bin/helm
+      /workspace/bin/helm version
 
-        # If a previous release is stuck pending, clean it once
-        if /workspace/helm -n vikunja list -q | grep -qx 'vikunja'; then
-          status="$(/workspace/helm -n vikunja status vikunja -o json 2>/dev/null | sed -n 's/.*"status":"\([^"]*\)".*/\1/p' || true)"
-          if [ "${status}" = "pending-install" ] || [ "${status}" = "pending-upgrade" ] || [ "${status}" = "pending-rollback" ]; then
-            /workspace/helm -n vikunja uninstall vikunja || true
-          fi
-        fi
+      # ---- use absolute chart path and print what Cloud Build can see ----
+      CHART_DIR="/workspace/helm/vikunja"
 
-        # Ensure the chart exists
-        test -f "./helm/vikunja/Chart.yaml" || { echo "ERROR: Chart not found at ./helm/vikunja"; exit 1; }
+      echo "pwd: $(pwd)"
+      echo "Top-level repo content:"; ls -la /workspace
+      echo "helm dir content:";      ls -la /workspace/helm || true
+      echo "chart dir content:";     ls -la "${CHART_DIR}" || true
 
-        # Deploy/upgrade.
-        # IMPORTANT: force image keys to strings to satisfy the chart templates.
-        /workspace/helm upgrade --install vikunja ./helm/vikunja \
-          --namespace vikunja --create-namespace \
-          --set-string image.api="vikunja/api:latest" \
-          --set-string image.frontend="vikunja/frontend:latest"
+      if [ ! -f "${CHART_DIR}/Chart.yaml" ]; then
+        echo "ERROR: Chart not found at ${CHART_DIR}"
+        exit 1
+      fi
+
+      # ---- deploy ----
+      /workspace/bin/helm upgrade --install vikunja "${CHART_DIR}" \
+        --namespace vikunja --create-namespace \
+        --set-string db.password="$(gcloud secrets versions access latest --secret=vikunja-db-password)" \
+        --wait --timeout 15m
